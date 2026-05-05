@@ -4,6 +4,30 @@ Automatically update or notify about Docker Compose container image updates.
 
 Hoist runs against all running containers, checks for newer images, and either recreates the container or fires a notification — all controlled by Docker labels.
 
+## Configuration
+
+Copy `hoist.conf.example` to one of the following locations (first found wins):
+
+1. `$HOIST_CONFIG` — explicit path via environment variable
+2. Same directory as `hoist.sh` — portable/dev installs
+3. `/etc/hoist/hoist.conf` — system installs
+
+CLI flags always override config file values.
+
+| Setting | Default | Description |
+|---|---|---|
+| `PARALLEL` | `1` | Containers to process concurrently |
+| `CACHE_LOCATION` | `/tmp` | Directory for notification dedup cache files |
+| `DOCKER_BINARY` | `$(which docker)` | Path to docker binary |
+| `PRUNE_IMAGES` | `true` | Prune dangling images after each run |
+| `LOG_FILE` | _(none)_ | Append log output to this file (in addition to stdout) |
+| `TAG` | _(none)_ | Default tag filter (same as `--tag`) |
+| `GLOBAL_DISCORD_WEBHOOK` | _(none)_ | Fallback Discord webhook for containers without a per-container label |
+| `GLOBAL_SLACK_WEBHOOK` | _(none)_ | Fallback Slack webhook |
+| `GLOBAL_GENERIC_WEBHOOK` | _(none)_ | Fallback generic webhook |
+
+Global webhooks fire for any container with `update` or `notify` enabled that has no per-container webhook label. Per-container labels always take precedence.
+
 ## Requirements
 
 - Docker with the `compose` subcommand (`docker compose`)

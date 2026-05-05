@@ -8,6 +8,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 There is no build system, no test suite, and no linter configuration. Requires `docker` (with `compose` subcommand) and `jq`.
 
+## Config File
+
+`hoist.conf.example` documents all available settings. At startup, `hoist.sh` sources the first config found at: `$HOIST_CONFIG` → `./hoist.conf` → `/etc/hoist/hoist.conf`. CLI flags override config values. Config is sourced before arg parsing so the load order is: defaults → config → CLI.
+
 ## Running
 
 ```bash
