@@ -143,6 +143,8 @@ send_slack_notification() {
 
 process_container() {
     local container_name="$1"
+    local safe_name
+    safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
     log "$container_name: Checking..."
 
     local inspect
@@ -263,13 +265,13 @@ process_container() {
                     status_generic="update_failure"
                     color=15158332
                 fi
-                rm -f "${CACHE_LOCATION}/hoist-${container_name}.notified"
+                rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
         fi
 
         if [[ $image_digest != "$container_image_digest" && $hoist_notify == true && $DRY_RUN != true ]]; then
             local notified_digest
-            notified_digest=$(cat "${CACHE_LOCATION}/hoist-${container_name}.notified" 2>/dev/null || true)
+            notified_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
             if [[ $notified_digest != "$image_digest" ]]; then
                 if [[ -n "${hoist_script_notify[*]}" ]]; then
                     log "$container_name: Executing notify script..."
@@ -303,7 +305,7 @@ process_container() {
                     log "$container_name: Sending Slack notification..."
                     send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
                 fi
-                echo "$image_digest" > "${CACHE_LOCATION}/hoist-${container_name}.notified"
+                echo "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
         fi
     fi
