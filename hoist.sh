@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+
+DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
+CACHE_LOCATION=/tmp
+TAG=""
+DRY_RUN=false
+PARALLEL=1
+
+log() { echo "[$(date +%T)] $*"; }
+
+while [[ "$1" != "" ]]; do
+    case "$1" in
+    --dry-run)    DRY_RUN=true ;;
+    --tag=*)      val="${1#*=}"; [[ -n $val ]] && TAG=".$val" ;;
+    --tag)        shift; [[ -n "$1" && "$1" != "--"* ]] && TAG=".$1" ;;
+    --parallel=*) val="${1#*=}"; [[ $val =~ ^[0-9]+$ ]] && PARALLEL=$val ;;
+    --parallel)   shift; [[ "$1" =~ ^[0-9]+$ ]] && PARALLEL="$1" ;;
+    esac
+    shift
+done
+
+log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL}"
+
+setup_environment() {
+    export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN
+    if [[ $PARALLEL -gt 1 ]]; then
+        export -f process_container compose_pull_wrapper compose_up_wrapper log
+        export -f send_discord_notification send_generic_webhook send_slack_notification
+    fi
+}
+
+compose_pull_wrapper() {
+    cd "$1" || exit 1
+    "${DOCKER_BINARY}" compose pull "$2"
+}
+
+compose_up_wrapper() {
+    cd "$1" || exit 1
+    "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2"
+}
+
+send_discord_notification() {
+    local description="$1" container="$2" old_version="$3" new_version="$4"
+    local image="$5" webhook="$6" old_revision="$7" new_revision="$8"
+    local old_digest="$9" new_digest="${10}" color="${11:-768753}"
+    local extra="" v_ind=">" r_ind=">" d_ind=">"
+    [[ $old_digest == "$new_digest" ]] && d_ind="="
+    if [[ -n $old_version && -n $new_version && -n $old_revision && -n $new_revision ]]; then
+        [[ $old_version == "$new_version" ]] && v_ind="="
+        [[ $old_revision == "$new_revision" ]] && r_ind="="
+        extra=',
+            {"name":"Version","value":"```\n'"$old_version"'\n ='"$v_ind"' '"$new_version"'```"},
+            {"name":"Revision","value":"```\n'"${old_revision:0:6}"'\n ='"$r_ind"' '"${new_revision:0:6}"'```"}'
+    fi
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d '{
+        "embeds": [{"description": "'"$description"'", "color": '"$color"', "fields": [
+            {"name": "Image", "value": "```'"$image"'```"},
+            {"name": "Image ID", "value": "```\n'"${old_digest:0:11}"'\n ='"$d_ind"' '"${new_digest:0:11}"'```"}'"$extra"'
+        ], "footer": {"text": "Powered by Hoist"}, "timestamp": "'"$(date -u +'%FT%T.%3NZ')"'"}],
+        "username": "Hoist"
+    }' "$webhook"
+}
+
+send_generic_webhook() {
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d '{
+        "type": "'"$1"'", "container": "'"$2"'", "image": "'"$5"'",
+        "old_image_id": "'"$9"'", "new_image_id": "'"${10}"'",
+        "old_version": "'"$3"'", "new_version": "'"$4"'",
+        "old_revision": "'"$7"'", "new_revision": "'"$8"'",
+        "timestamp": "'"$(date -u +'%FT%T.%3NZ')"'"
+    }' "$6"
+}
+
+send_slack_notification() {
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+        -d '{"text": "'"$1"'"}' "$2"
+}
+
+process_container() {
+    local container_name="$1"
+    log "$container_name: Checking..."
+
+    local inspect
+    inspect=$("${DOCKER_BINARY}" inspect "$container_name") || {
+        log "$container_name: inspect failed"
+        return 1
+    }
+
+    local image_name container_image_digest
+    local docker_compose_service docker_compose_version docker_compose_workdir
+    local old_oci_version old_oci_revision
+    local hoist_update hoist_notify hoist_discord_webhook hoist_generic_webhook hoist_slack_webhook
+    local hoist_registry_authfile
+    local -a hoist_script_update hoist_script_notify
+
+    readarray -t _vals < <(jq -r --arg tag "$TAG" '
+        .[0] |
+        .Config.Image,
+        .Image,
+        (.Config.Labels["com.docker.compose.service"] // ""),
+        (.Config.Labels["com.docker.compose.version"] // ""),
+        (.Config.Labels["com.docker.compose.project.working_dir"] // ""),
+        (.Config.Labels["org.opencontainers.image.version"] // ""),
+        (.Config.Labels["org.opencontainers.image.revision"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).update"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).notify"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).discord.webhook"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).generic.webhook"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).slack.webhook"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).script.update"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).script.notify"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // "")
+    ' <<< "$inspect")
+
+    image_name="${_vals[0]}"
+    container_image_digest="${_vals[1]}"
+    docker_compose_service="${_vals[2]}"
+    docker_compose_version="${_vals[3]}"
+    docker_compose_workdir="${_vals[4]}"
+    old_oci_version="${_vals[5]}"
+    old_oci_revision="${_vals[6]}"
+    hoist_update="${_vals[7]}"
+    hoist_notify="${_vals[8]}"
+    hoist_discord_webhook="${_vals[9]}"
+    hoist_generic_webhook="${_vals[10]}"
+    hoist_slack_webhook="${_vals[11]}"
+    read -ra hoist_script_update <<< "${_vals[12]}"
+    read -ra hoist_script_notify <<< "${_vals[13]}"
+    hoist_registry_authfile="${_vals[14]}"
+
+    if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
+        if [[ -f $hoist_registry_authfile ]]; then
+            log "$container_name: Registry login..."
+            if [[ $DRY_RUN != true ]]; then
+                jq -r .password < "$hoist_registry_authfile" | \
+                    "${DOCKER_BINARY}" login \
+                        --username "$(jq -r .username < "$hoist_registry_authfile")" \
+                        --password-stdin \
+                        "$(jq -r .registry < "$hoist_registry_authfile")"
+            fi
+        fi
+
+        local image_digest new_oci_version new_oci_revision
+        if [[ $DRY_RUN == true ]]; then
+            log "$container_name: [dry-run] would pull image"
+            image_digest="$container_image_digest"
+        else
+            log "$container_name: Pulling image..."
+            compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || \
+                log "$container_name: Pull failed"
+
+            local image_inspect
+            image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name")
+            readarray -t _img < <(jq -r '
+                .[0] |
+                .Id,
+                (.Config.Labels["org.opencontainers.image.version"] // ""),
+                (.Config.Labels["org.opencontainers.image.revision"] // "")
+            ' <<< "$image_inspect")
+            image_digest="${_img[0]}"
+            new_oci_version="${_img[1]}"
+            new_oci_revision="${_img[2]}"
+        fi
+
+        local status="Update available" status_generic="update_available" color=768753
+
+        if [[ $image_digest != "$container_image_digest" && $hoist_update == true ]]; then
+            if [[ $DRY_RUN == true ]]; then
+                log "$container_name: [dry-run] would update container"
+            else
+                if [[ -n "${hoist_script_update[*]}" ]]; then
+                    log "$container_name: Stopping container..."
+                    "${DOCKER_BINARY}" stop "$container_name"
+                    log "$container_name: Executing update script..."
+                    export HOIST_CONTAINER="$container_name"
+                    export HOIST_IMAGE="$image_name"
+                    export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
+                    export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
+                    export HOIST_OLD_VERSION="$old_oci_version"
+                    export HOIST_NEW_VERSION="$new_oci_version"
+                    export HOIST_OLD_REVISION="$old_oci_revision"
+                    export HOIST_NEW_REVISION="$new_oci_revision"
+                    export HOIST_COMPOSE_SERVICE="$docker_compose_service"
+                    export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
+                    "${hoist_script_update[@]}"
+                fi
+                log "$container_name: Updating container..."
+                if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
+                    status="Update succeeded"
+                    status_generic="update_success"
+                    color=3066993
+                else
+                    log "$container_name: Update failed"
+                    status="Update failed"
+                    status_generic="update_failure"
+                    color=15158332
+                fi
+                rm -f "${CACHE_LOCATION}/hoist-${container_name}.notified"
+            fi
+        fi
+
+        if [[ $image_digest != "$container_image_digest" && $hoist_notify == true && $DRY_RUN != true ]]; then
+            local notified_digest
+            notified_digest=$(cat "${CACHE_LOCATION}/hoist-${container_name}.notified" 2>/dev/null || true)
+            if [[ $notified_digest != "$image_digest" ]]; then
+                if [[ -n "${hoist_script_notify[*]}" ]]; then
+                    log "$container_name: Executing notify script..."
+                    export HOIST_CONTAINER="$container_name"
+                    export HOIST_IMAGE="$image_name"
+                    export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
+                    export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
+                    export HOIST_OLD_VERSION="$old_oci_version"
+                    export HOIST_NEW_VERSION="$new_oci_version"
+                    export HOIST_OLD_REVISION="$old_oci_revision"
+                    export HOIST_NEW_REVISION="$new_oci_revision"
+                    export HOIST_COMPOSE_SERVICE="$docker_compose_service"
+                    export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
+                    "${hoist_script_notify[@]}"
+                fi
+                if [[ -n $hoist_discord_webhook ]]; then
+                    log "$container_name: Sending Discord notification..."
+                    send_discord_notification "$status" "$container_name" \
+                        "$old_oci_version" "$new_oci_version" "$image_name" \
+                        "$hoist_discord_webhook" "$old_oci_revision" "$new_oci_revision" \
+                        "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
+                fi
+                if [[ -n $hoist_generic_webhook ]]; then
+                    log "$container_name: Sending generic webhook..."
+                    send_generic_webhook "$status_generic" "$container_name" \
+                        "$old_oci_version" "$new_oci_version" "$image_name" \
+                        "$hoist_generic_webhook" "$old_oci_revision" "$new_oci_revision" \
+                        "${container_image_digest#sha256:}" "${image_digest#sha256:}"
+                fi
+                if [[ -n $hoist_slack_webhook ]]; then
+                    log "$container_name: Sending Slack notification..."
+                    send_slack_notification "[$container_name] $status: $image_name" "$hoist_slack_webhook"
+                fi
+                echo "$image_digest" > "${CACHE_LOCATION}/hoist-${container_name}.notified"
+            fi
+        fi
+    fi
+}
+
+trap 'exit 130' INT
+
+declare -a containers
+readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
+setup_environment
+
+log "Processing ${#containers[@]} containers (parallelism: $PARALLEL)"
+
+if [[ $PARALLEL -gt 1 ]]; then
+    printf '%s\n' "${containers[@]}" | xargs -P "$PARALLEL" -I {} bash -c 'process_container "$@"' _ {}
+else
+    for container_name in "${containers[@]}"; do
+        process_container "$container_name"
+    done
+fi
+
+if [[ $DRY_RUN != true ]]; then
+    log "Pruning docker images..."
+    "${DOCKER_BINARY}" image prune --force
+fi
