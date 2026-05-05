@@ -1,0 +1,28 @@
+# hoist.conf — copy to hoist.conf, /etc/hoist/hoist.conf, or set HOIST_CONFIG=/path/to/this
+#
+# Config is loaded at startup. CLI flags override config values.
+# Discovery order: $HOIST_CONFIG → ./hoist.conf → /etc/hoist/hoist.conf
+
+# Number of containers to process in parallel (default: 1)
+# PARALLEL=4
+
+# Directory for notification deduplication cache files (default: /tmp)
+# CACHE_LOCATION=/var/cache/hoist
+
+# Path to docker binary (default: $(which docker))
+# DOCKER_BINARY=/usr/bin/docker
+
+# Prune dangling images after each run (default: true)
+# PRUNE_IMAGES=true
+
+# Append all log output to this file in addition to stdout (default: disabled)
+# LOG_FILE=/var/log/hoist.log
+
+# Default tag filter — equivalent to passing --tag on every run (default: none)
+# TAG=production
+
+# Global fallback webhooks — used for any container that has update/notify enabled
+# but no per-container webhook label set. Per-container labels always take precedence.
+# GLOBAL_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+# GLOBAL_SLACK_WEBHOOK=https://hooks.slack.com/services/...
+# GLOBAL_GENERIC_WEBHOOK=https://example.com/webhook

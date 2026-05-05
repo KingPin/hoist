@@ -5,8 +5,27 @@ CACHE_LOCATION=/tmp
 TAG=""
 DRY_RUN=false
 PARALLEL=1
+PRUNE_IMAGES=true
+LOG_FILE=""
+GLOBAL_DISCORD_WEBHOOK=""
+GLOBAL_SLACK_WEBHOOK=""
+GLOBAL_GENERIC_WEBHOOK=""
 
-log() { echo "[$(date +%T)] $*"; }
+log() {
+    local msg="[$(date +%T)] $*"
+    echo "$msg"
+    [[ -n $LOG_FILE ]] && echo "$msg" >> "$LOG_FILE"
+}
+
+_load_config() {
+    local cfg=""
+    if   [[ -n $HOIST_CONFIG && -f $HOIST_CONFIG ]];   then cfg="$HOIST_CONFIG"
+    elif [[ -f "$(dirname "$0")/hoist.conf" ]];         then cfg="$(dirname "$0")/hoist.conf"
+    elif [[ -f /etc/hoist/hoist.conf ]];                then cfg=/etc/hoist/hoist.conf
+    fi
+    [[ -n $cfg ]] && { log "Loading config: $cfg"; source "$cfg"; }
+}
+_load_config
 
 while [[ "$1" != "" ]]; do
     case "$1" in
@@ -23,6 +42,8 @@ log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL}"
 
 setup_environment() {
     export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN
+    export PRUNE_IMAGES LOG_FILE
+    export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
     if [[ $PARALLEL -gt 1 ]]; then
         export -f process_container compose_pull_wrapper compose_up_wrapper log
         export -f send_discord_notification send_generic_webhook send_slack_notification
@@ -124,6 +145,9 @@ process_container() {
     hoist_discord_webhook="${_vals[9]}"
     hoist_generic_webhook="${_vals[10]}"
     hoist_slack_webhook="${_vals[11]}"
+    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
+    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
+    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
     read -ra hoist_script_update <<< "${_vals[12]}"
     read -ra hoist_script_notify <<< "${_vals[13]}"
     hoist_registry_authfile="${_vals[14]}"
@@ -217,23 +241,23 @@ process_container() {
                     export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
                     "${hoist_script_notify[@]}"
                 fi
-                if [[ -n $hoist_discord_webhook ]]; then
+                if [[ -n $effective_discord ]]; then
                     log "$container_name: Sending Discord notification..."
                     send_discord_notification "$status" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
-                        "$hoist_discord_webhook" "$old_oci_revision" "$new_oci_revision" \
+                        "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
                 fi
-                if [[ -n $hoist_generic_webhook ]]; then
+                if [[ -n $effective_generic ]]; then
                     log "$container_name: Sending generic webhook..."
                     send_generic_webhook "$status_generic" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
-                        "$hoist_generic_webhook" "$old_oci_revision" "$new_oci_revision" \
+                        "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 fi
-                if [[ -n $hoist_slack_webhook ]]; then
+                if [[ -n $effective_slack ]]; then
                     log "$container_name: Sending Slack notification..."
-                    send_slack_notification "[$container_name] $status: $image_name" "$hoist_slack_webhook"
+                    send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
                 fi
                 echo "$image_digest" > "${CACHE_LOCATION}/hoist-${container_name}.notified"
             fi
@@ -257,7 +281,7 @@ else
     done
 fi
 
-if [[ $DRY_RUN != true ]]; then
+if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     log "Pruning docker images..."
     "${DOCKER_BINARY}" image prune --force
 fi
