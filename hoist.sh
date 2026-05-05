@@ -53,18 +53,27 @@ setup_environment() {
 }
 
 check_maintenance_window() {
-    [[ -z "$MAINTENANCE_WINDOW" || "$DRY_RUN" == true ]] && return 0
+    [[ -z "$MAINTENANCE_WINDOW" ]] && return 0
+    if [[ "$DRY_RUN" == true ]]; then
+        log "Maintenance window check bypassed (dry-run)"
+        return 0
+    fi
     local start end current
     start=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f1 | tr -d ':')
     end=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f2 | tr -d ':')
     current=$(date +%H%M)
     if [[ "$start" -le "$end" ]]; then
-        [[ "$current" -lt "$start" || "$current" -ge "$end" ]] && {
-            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."; exit 0; }
+        if [[ "$current" -lt "$start" || "$current" -ge "$end" ]]; then
+            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
+            exit 0
+        fi
     else
-        [[ "$current" -lt "$start" && "$current" -ge "$end" ]] && {
-            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."; exit 0; }
+        if [[ "$current" -lt "$start" && "$current" -ge "$end" ]]; then
+            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
+            exit 0
+        fi
     fi
+    log "Within maintenance window ($MAINTENANCE_WINDOW), proceeding."
 }
 
 compose_pull_wrapper() {
