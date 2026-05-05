@@ -21,6 +21,9 @@
 # Default tag filter — equivalent to passing --tag on every run (default: none)
 # TAG=production
 
+# Log containers skipped due to missing hoist labels (default: false). Automatically enabled by --dry-run.
+# VERBOSE=true
+
 # Only run during this time window (24h format HH:MM-HH:MM). Midnight-spanning works: "22:00-04:00".
 # Leave empty to run any time. --dry-run bypasses this check.
 # MAINTENANCE_WINDOW=02:00-06:00

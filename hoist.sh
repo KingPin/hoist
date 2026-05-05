@@ -11,6 +11,7 @@ GLOBAL_DISCORD_WEBHOOK=""
 GLOBAL_SLACK_WEBHOOK=""
 GLOBAL_GENERIC_WEBHOOK=""
 MAINTENANCE_WINDOW=""
+VERBOSE=false
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -30,7 +31,8 @@ _load_config
 
 while [[ "$1" != "" ]]; do
     case "$1" in
-    --dry-run)    DRY_RUN=true ;;
+    --dry-run)    DRY_RUN=true; VERBOSE=true ;;
+    --verbose)    VERBOSE=true ;;
     --tag=*)      val="${1#*=}"; [[ -n $val ]] && TAG=".$val" ;;
     --tag)        shift; [[ -n "$1" && "$1" != "--"* ]] && TAG=".$1" ;;
     --parallel=*) val="${1#*=}"; [[ $val =~ ^[0-9]+$ ]] && PARALLEL=$val ;;
@@ -39,10 +41,10 @@ while [[ "$1" != "" ]]; do
     shift
 done
 
-log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL}"
+log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 
 setup_environment() {
-    export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN
+    export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE
     export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
     if [[ $PARALLEL -gt 1 ]]; then
@@ -320,6 +322,8 @@ process_container() {
                 echo "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
         fi
+    else
+        [[ $VERBOSE == true ]] && log "$container_name: Skipped (no hoist labels)"
     fi
 }
 
