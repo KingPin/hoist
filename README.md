@@ -116,6 +116,17 @@ When `script.update` or `script.notify` fires, these environment variables are a
 | `HOIST_COMPOSE_SERVICE` | Compose service name |
 | `HOIST_COMPOSE_WORKDIR` | Compose project working directory |
 
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `docker: command not found` | `DOCKER_BINARY` not set or docker not in PATH | Set `DOCKER_BINARY=/usr/bin/docker` in config |
+| `jq: command not found` | jq not installed | Install jq (`apt install jq`, `brew install jq`, etc.) |
+| `compose workdir missing` / container skipped silently | Container has no `com.docker.compose.project.working_dir` label | Container wasn't started via `docker compose` — hoist only manages Compose-managed containers |
+| Container never updates despite new image | Label typo or wrong tag | Check label spelling; if using `--tag nightly`, labels must be `com.sumguy.hoist.nightly.*` |
+| Notifications fire every run | `CACHE_LOCATION` is cleaned between runs (e.g. tmpfs) | Set `CACHE_LOCATION` to a persistent path |
+| Script runs but exits immediately | `MAINTENANCE_WINDOW` set and current time is outside it | Expected behavior — adjust window or run with `--dry-run` to bypass |
+
 ## Running on a schedule
 
 Example cron entry to check for updates every day at 4 AM:
