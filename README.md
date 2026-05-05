@@ -4,6 +4,8 @@ Automatically update or notify about Docker Compose container image updates.
 
 Hoist runs against all running containers, checks for newer images, and either recreates the container or fires a notification — all controlled by Docker labels.
 
+Inspired by [pullio](https://github.com/hotio/pullio). Migrating from pullio is straightforward — swap the label prefix from `org.hotio.pullio` to `com.sumguy.hoist` and you're done.
+
 ## Configuration
 
 Copy `hoist.conf.example` to one of the following locations (first found wins):
