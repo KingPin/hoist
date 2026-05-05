@@ -123,14 +123,14 @@ process_container() {
         (.Config.Labels["com.docker.compose.project.working_dir"] // ""),
         (.Config.Labels["org.opencontainers.image.version"] // ""),
         (.Config.Labels["org.opencontainers.image.revision"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).update"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).notify"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).discord.webhook"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).generic.webhook"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).slack.webhook"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).script.update"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).script.notify"] // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // "")
+        (.Config.Labels["com.sumguy.hoist\($tag).update"]            // .Config.Labels["org.hotio.pullio\($tag).update"]            // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).notify"]            // .Config.Labels["org.hotio.pullio\($tag).notify"]            // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).discord.webhook"]   // .Config.Labels["org.hotio.pullio\($tag).discord.webhook"]   // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).generic.webhook"]   // .Config.Labels["org.hotio.pullio\($tag).generic.webhook"]   // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).slack.webhook"]     // .Config.Labels["org.hotio.pullio\($tag).slack.webhook"]     // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).script.update"]     // .Config.Labels["org.hotio.pullio\($tag).script.update"]     // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).script.notify"]     // .Config.Labels["org.hotio.pullio\($tag).script.notify"]     // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // "")
     ' <<< "$inspect")
 
     image_name="${_vals[0]}"
