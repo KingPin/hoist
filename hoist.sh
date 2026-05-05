@@ -81,38 +81,64 @@ send_discord_notification() {
     local description="$1" container="$2" old_version="$3" new_version="$4"
     local image="$5" webhook="$6" old_revision="$7" new_revision="$8"
     local old_digest="$9" new_digest="${10}" color="${11:-768753}"
-    local extra="" v_ind=">" r_ind=">" d_ind=">"
+    local v_ind=">" r_ind=">" d_ind=">"
     [[ $old_digest == "$new_digest" ]] && d_ind="="
+
+    local fields
+    fields=$(jq -n \
+        --arg container "$container" \
+        --arg image "$image" \
+        --arg old_d "${old_digest:0:11}" \
+        --arg new_d "${new_digest:0:11}" \
+        --arg d_ind "$d_ind" \
+        '[{"name":"Container","value":("```" + $container + "```")},
+          {"name":"Image","value":("```" + $image + "```")},
+          {"name":"Image ID","value":("```\n" + $old_d + "\n =" + $d_ind + " " + $new_d + "```")}]')
+
     if [[ -n $old_version && -n $new_version && -n $old_revision && -n $new_revision ]]; then
         [[ $old_version == "$new_version" ]] && v_ind="="
         [[ $old_revision == "$new_revision" ]] && r_ind="="
-        extra=',
-            {"name":"Version","value":"```\n'"$old_version"'\n ='"$v_ind"' '"$new_version"'```"},
-            {"name":"Revision","value":"```\n'"${old_revision:0:6}"'\n ='"$r_ind"' '"${new_revision:0:6}"'```"}'
+        fields=$(jq -n \
+            --argjson base "$fields" \
+            --arg old_v "$old_version" --arg new_v "$new_version" --arg v_ind "$v_ind" \
+            --arg old_r "${old_revision:0:6}" --arg new_r "${new_revision:0:6}" --arg r_ind "$r_ind" \
+            '$base + [{"name":"Version","value":("```\n" + $old_v + "\n =" + $v_ind + " " + $new_v + "```")},
+                      {"name":"Revision","value":("```\n" + $old_r + "\n =" + $r_ind + " " + $new_r + "```")}]')
     fi
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d '{
-        "embeds": [{"title": "'"$description"'", "color": '"$color"', "fields": [
-            {"name": "Container", "value": "```'"$container"'```"},
-            {"name": "Image", "value": "```'"$image"'```"},
-            {"name": "Image ID", "value": "```\n'"${old_digest:0:11}"'\n ='"$d_ind"' '"${new_digest:0:11}"'```"}'"$extra"'
-        ], "footer": {"text": "Powered by Hoist"}, "timestamp": "'"$(date -u +'%FT%T.%3NZ')"'"}],
-        "username": "Hoist"
-    }' "$webhook"
+
+    local payload
+    payload=$(jq -n \
+        --arg title "$description" \
+        --argjson color "$color" \
+        --argjson fields "$fields" \
+        --arg ts "$(date -u +'%FT%T.%3NZ')" \
+        '{"embeds":[{"title":$title,"color":$color,"fields":$fields,
+            "footer":{"text":"Powered by Hoist"},"timestamp":$ts}],
+          "username":"Hoist"}')
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
 }
 
 send_generic_webhook() {
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d '{
-        "type": "'"$1"'", "container": "'"$2"'", "image": "'"$5"'",
-        "old_image_id": "'"$9"'", "new_image_id": "'"${10}"'",
-        "old_version": "'"$3"'", "new_version": "'"$4"'",
-        "old_revision": "'"$7"'", "new_revision": "'"$8"'",
-        "timestamp": "'"$(date -u +'%FT%T.%3NZ')"'"
-    }' "$6"
+    local payload
+    payload=$(jq -n \
+        --arg type "$1" --arg container "$2" \
+        --arg old_version "$3" --arg new_version "$4" \
+        --arg image "$5" \
+        --arg old_revision "$7" --arg new_revision "$8" \
+        --arg old_image_id "$9" --arg new_image_id "${10}" \
+        --arg ts "$(date -u +'%FT%T.%3NZ')" \
+        '{"type":$type,"container":$container,"image":$image,
+          "old_image_id":$old_image_id,"new_image_id":$new_image_id,
+          "old_version":$old_version,"new_version":$new_version,
+          "old_revision":$old_revision,"new_revision":$new_revision,
+          "timestamp":$ts}')
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$6"
 }
 
 send_slack_notification() {
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-        -d '{"text": "'"$1"'"}' "$2"
+    local payload
+    payload=$(jq -n --arg text "$1" '{"text":$text}')
+    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
 }
 
 process_container() {
