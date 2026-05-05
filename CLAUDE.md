@@ -26,11 +26,12 @@ bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>]
 
 The script processes all running Docker containers in a single pass:
 
-1. **Container discovery** — `docker ps` lists all running containers
-2. **Label inspection** — one `docker inspect` call per container, all fields extracted via `jq` in one pass
-3. **Image pull** — `docker compose pull` via `compose_pull_wrapper`
-4. **Update/notify decision** — compares the pulled image digest against the running container's digest; acts only if they differ
-5. **Action** — either `compose_up_wrapper` (recreate container) or webhook/script notification
+1. **Maintenance window check** — if `MAINTENANCE_WINDOW` is set in config and the current time is outside the window, exits cleanly (0) before doing anything; `--dry-run` bypasses this
+2. **Container discovery** — `docker ps` lists all running containers
+3. **Label inspection** — one `docker inspect` call per container, all fields extracted via `jq` in one pass
+4. **Image pull** — `docker compose pull` via `compose_pull_wrapper`
+5. **Update/notify decision** — compares the pulled image digest against the running container's digest; acts only if they differ
+6. **Action** — either `compose_up_wrapper` (recreate container) or webhook/script notification
 
 ### Label namespace
 

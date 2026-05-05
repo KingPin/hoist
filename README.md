@@ -27,8 +27,18 @@ CLI flags always override config file values.
 | `GLOBAL_DISCORD_WEBHOOK` | _(none)_ | Fallback Discord webhook for containers without a per-container label |
 | `GLOBAL_SLACK_WEBHOOK` | _(none)_ | Fallback Slack webhook |
 | `GLOBAL_GENERIC_WEBHOOK` | _(none)_ | Fallback generic webhook |
+| `MAINTENANCE_WINDOW` | _(none)_ | Only run during this time window (e.g. `02:00-06:00`). Midnight-spanning works: `22:00-04:00`. Dry-run bypasses this. |
 
 Global webhooks fire for any container with `update` or `notify` enabled that has no per-container webhook label. Per-container labels always take precedence.
+
+## Installation
+
+```bash
+sudo cp hoist.sh /usr/local/bin/hoist
+sudo chmod +x /usr/local/bin/hoist
+```
+
+For system-wide config, place `hoist.conf` at `/etc/hoist/hoist.conf`.
 
 ## Requirements
 

@@ -10,6 +10,7 @@ LOG_FILE=""
 GLOBAL_DISCORD_WEBHOOK=""
 GLOBAL_SLACK_WEBHOOK=""
 GLOBAL_GENERIC_WEBHOOK=""
+MAINTENANCE_WINDOW=""
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -42,11 +43,27 @@ log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL}"
 
 setup_environment() {
     export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN
-    export PRUNE_IMAGES LOG_FILE
+    export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
     if [[ $PARALLEL -gt 1 ]]; then
         export -f process_container compose_pull_wrapper compose_up_wrapper log
         export -f send_discord_notification send_generic_webhook send_slack_notification
+        export -f check_maintenance_window
+    fi
+}
+
+check_maintenance_window() {
+    [[ -z "$MAINTENANCE_WINDOW" || "$DRY_RUN" == true ]] && return 0
+    local start end current
+    start=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f1 | tr -d ':')
+    end=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f2 | tr -d ':')
+    current=$(date +%H%M)
+    if [[ "$start" -le "$end" ]]; then
+        [[ "$current" -lt "$start" || "$current" -ge "$end" ]] && {
+            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."; exit 0; }
+    else
+        [[ "$current" -lt "$start" && "$current" -ge "$end" ]] && {
+            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."; exit 0; }
     fi
 }
 
@@ -271,6 +288,7 @@ trap 'exit 130' INT
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
 setup_environment
+check_maintenance_window
 
 log "Processing ${#containers[@]} containers (parallelism: $PARALLEL)"
 

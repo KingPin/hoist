@@ -21,6 +21,10 @@
 # Default tag filter — equivalent to passing --tag on every run (default: none)
 # TAG=production
 
+# Only run during this time window (24h format HH:MM-HH:MM). Midnight-spanning works: "22:00-04:00".
+# Leave empty to run any time. --dry-run bypasses this check.
+# MAINTENANCE_WINDOW=02:00-06:00
+
 # Global fallback webhooks — used for any container that has update/notify enabled
 # but no per-container webhook label set. Per-container labels always take precedence.
 # GLOBAL_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
