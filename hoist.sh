@@ -74,7 +74,8 @@ send_discord_notification() {
             {"name":"Revision","value":"```\n'"${old_revision:0:6}"'\n ='"$r_ind"' '"${new_revision:0:6}"'```"}'
     fi
     curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d '{
-        "embeds": [{"description": "'"$description"'", "color": '"$color"', "fields": [
+        "embeds": [{"title": "'"$description"'", "color": '"$color"', "fields": [
+            {"name": "Container", "value": "```'"$container"'```"},
             {"name": "Image", "value": "```'"$image"'```"},
             {"name": "Image ID", "value": "```\n'"${old_digest:0:11}"'\n ='"$d_ind"' '"${new_digest:0:11}"'```"}'"$extra"'
         ], "footer": {"text": "Powered by Hoist"}, "timestamp": "'"$(date -u +'%FT%T.%3NZ')"'"}],
@@ -186,7 +187,7 @@ process_container() {
             new_oci_revision="${_img[2]}"
         fi
 
-        local status="Update available" status_generic="update_available" color=768753
+        local status="🔄 Update available" status_generic="update_available" color=768753
 
         if [[ $image_digest != "$container_image_digest" && $hoist_update == true ]]; then
             if [[ $DRY_RUN == true ]]; then
@@ -210,12 +211,12 @@ process_container() {
                 fi
                 log "$container_name: Updating container..."
                 if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
-                    status="Update succeeded"
+                    status="✅ Update succeeded"
                     status_generic="update_success"
                     color=3066993
                 else
                     log "$container_name: Update failed"
-                    status="Update failed"
+                    status="❌ Update failed"
                     status_generic="update_failure"
                     color=15158332
                 fi

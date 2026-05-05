@@ -111,7 +111,7 @@ When `script.update` or `script.notify` fires, these environment variables are a
 Example cron entry to check for updates every day at 4 AM:
 
 ```cron
-0 4 * * * /opt/hoist/hoist.sh --parallel 4 >> /var/log/hoist.log 2>&1
+0 4 * * * hoist --parallel 4 >> /var/log/hoist.log 2>&1
 ```
 
 ## Notifications
