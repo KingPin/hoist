@@ -24,6 +24,9 @@
 # Log containers skipped due to missing hoist labels (default: false). Automatically enabled by --dry-run.
 # VERBOSE=true
 
+# Maximum time in seconds for webhook HTTP requests (default: 30).
+# CURL_TIMEOUT=30
+
 # Only run during this time window (24h format HH:MM-HH:MM). Midnight-spanning works: "22:00-04:00".
 # Leave empty to run any time. --dry-run bypasses this check.
 # MAINTENANCE_WINDOW=02:00-06:00

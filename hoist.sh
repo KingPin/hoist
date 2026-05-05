@@ -12,6 +12,7 @@ GLOBAL_SLACK_WEBHOOK=""
 GLOBAL_GENERIC_WEBHOOK=""
 MAINTENANCE_WINDOW=""
 VERBOSE=false
+CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -41,16 +42,25 @@ while [[ "$1" != "" ]]; do
     shift
 done
 
+[[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
+
+for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK; do
+    _wh_val="${!_wh_var}"
+    if [[ -n "$_wh_val" ]]; then
+        [[ "$_wh_val" =~ ^https?:// ]] || { echo "Error: $_wh_var is not a valid http(s) URL: $_wh_val"; exit 1; }
+    fi
+done
+
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 
 setup_environment() {
-    export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE
+    export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE CURL_TIMEOUT
     export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
     if [[ $PARALLEL -gt 1 ]]; then
         export -f process_container compose_pull_wrapper compose_up_wrapper log
         export -f send_discord_notification send_generic_webhook send_slack_notification
-        export -f check_maintenance_window
+        export -f check_maintenance_window validate_webhook_url validate_script_path
     fi
 }
 
@@ -79,13 +89,26 @@ check_maintenance_window() {
 }
 
 compose_pull_wrapper() {
-    cd "$1" || exit 1
+    [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
+    cd "$1" || { log "Error: cannot cd to compose workdir: $1"; return 1; }
     "${DOCKER_BINARY}" compose pull "$2"
 }
 
 compose_up_wrapper() {
-    cd "$1" || exit 1
+    [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
+    cd "$1" || { log "Error: cannot cd to compose workdir: $1"; return 1; }
     "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2"
+}
+
+validate_webhook_url() {
+    [[ "$1" =~ ^https?:// ]] || { log "Error: invalid webhook URL (must start with http:// or https://): $1"; return 1; }
+}
+
+validate_script_path() {
+    local path="$1"
+    [[ -z "$path" ]] && return 0
+    [[ "$path" == /* ]] || { log "SECURITY: script path must be absolute: $path"; return 1; }
+    [[ -x "$path" ]] || { log "SECURITY: script path is not executable: $path"; return 1; }
 }
 
 send_discord_notification() {
@@ -126,7 +149,9 @@ send_discord_notification() {
         '{"embeds":[{"title":$title,"color":$color,"fields":$fields,
             "footer":{"text":"Powered by Hoist"},"timestamp":$ts}],
           "username":"Hoist"}')
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
+    validate_webhook_url "$webhook" || return 1
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
 }
 
 send_generic_webhook() {
@@ -143,13 +168,17 @@ send_generic_webhook() {
           "old_version":$old_version,"new_version":$new_version,
           "old_revision":$old_revision,"new_revision":$new_revision,
           "timestamp":$ts}')
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$6"
+    validate_webhook_url "$6" || return 1
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$6"
 }
 
 send_slack_notification() {
     local payload
     payload=$(jq -n --arg text "$1" '{"text":$text}')
-    curl -fsSL -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
+    validate_webhook_url "$2" || return 1
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
 }
 
 process_container() {
@@ -210,16 +239,32 @@ process_container() {
     read -ra hoist_script_update <<< "${_vals[12]}"
     read -ra hoist_script_notify <<< "${_vals[13]}"
     hoist_registry_authfile="${_vals[14]}"
+    if [[ -n "${hoist_script_update[0]}" ]]; then
+        validate_script_path "${hoist_script_update[0]}" || {
+            log "$container_name: script.update label rejected; skipping"
+            hoist_script_update=()
+        }
+    fi
+    if [[ -n "${hoist_script_notify[0]}" ]]; then
+        validate_script_path "${hoist_script_notify[0]}" || {
+            log "$container_name: script.notify label rejected; skipping"
+            hoist_script_notify=()
+        }
+    fi
 
     if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
-        if [[ -f $hoist_registry_authfile ]]; then
-            log "$container_name: Registry login..."
-            if [[ $DRY_RUN != true ]]; then
-                jq -r .password < "$hoist_registry_authfile" | \
-                    "${DOCKER_BINARY}" login \
-                        --username "$(jq -r .username < "$hoist_registry_authfile")" \
-                        --password-stdin \
-                        "$(jq -r .registry < "$hoist_registry_authfile")"
+        if [[ -n "$hoist_registry_authfile" ]]; then
+            if [[ "$hoist_registry_authfile" != /* ]]; then
+                log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
+            elif [[ -f "$hoist_registry_authfile" ]]; then
+                log "$container_name: Registry login..."
+                if [[ $DRY_RUN != true ]]; then
+                    jq -r .password < "$hoist_registry_authfile" | \
+                        "${DOCKER_BINARY}" login \
+                            --username "$(jq -r .username < "$hoist_registry_authfile")" \
+                            --password-stdin \
+                            "$(jq -r .registry < "$hoist_registry_authfile")"
+                fi
             fi
         fi
 
@@ -229,8 +274,10 @@ process_container() {
             image_digest="$container_image_digest"
         else
             log "$container_name: Pulling image..."
-            compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || \
+            compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
                 log "$container_name: Pull failed"
+                return 1
+            }
 
             local image_inspect _img_out
             image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name")
@@ -319,7 +366,7 @@ process_container() {
                     log "$container_name: Sending Slack notification..."
                     send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
                 fi
-                echo "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified"
+                ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
             fi
         fi
     else
