@@ -160,7 +160,8 @@ process_container() {
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
-    readarray -t _vals < <(jq -r --arg tag "$TAG" '
+    local _jq_out
+    _jq_out=$(jq -r --arg tag "$TAG" '
         .[0] |
         .Config.Image,
         .Image,
@@ -177,7 +178,8 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).script.update"]     // .Config.Labels["org.hotio.pullio\($tag).script.update"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).script.notify"]     // .Config.Labels["org.hotio.pullio\($tag).script.notify"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // "")
-    ' <<< "$inspect")
+    ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
+    readarray -t _vals <<< "$_jq_out"
 
     image_name="${_vals[0]}"
     container_image_digest="${_vals[1]}"
@@ -219,14 +221,15 @@ process_container() {
             compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || \
                 log "$container_name: Pull failed"
 
-            local image_inspect
+            local image_inspect _img_out
             image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name")
-            readarray -t _img < <(jq -r '
+            _img_out=$(jq -r '
                 .[0] |
                 .Id,
                 (.Config.Labels["org.opencontainers.image.version"] // ""),
                 (.Config.Labels["org.opencontainers.image.revision"] // "")
-            ' <<< "$image_inspect")
+            ' <<< "$image_inspect") || { log "$container_name: failed to parse image inspect output"; return 1; }
+            readarray -t _img <<< "$_img_out"
             image_digest="${_img[0]}"
             new_oci_version="${_img[1]}"
             new_oci_revision="${_img[2]}"
