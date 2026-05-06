@@ -50,7 +50,15 @@ while [[ "$1" != "" ]]; do
     shift
 done
 
+if [[ $DO_SELF_UPDATE == true ]]; then
+    _self_update_check true "$FORCE"
+fi
+
 [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
+
+if [[ $UPDATE_CHECK != "off" ]]; then
+    _self_update_check false false
+fi
 
 for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK; do
     _wh_val="${!_wh_var}"
