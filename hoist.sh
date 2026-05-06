@@ -16,6 +16,8 @@ MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 UPDATE_CHECK="${UPDATE_CHECK:-notify}"
+DO_SELF_UPDATE=false
+FORCE=false
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -41,6 +43,9 @@ while [[ "$1" != "" ]]; do
     --tag)        shift; [[ -n "$1" && "$1" != "--"* ]] && TAG=".$1" ;;
     --parallel=*) val="${1#*=}"; [[ $val =~ ^[0-9]+$ ]] && PARALLEL=$val ;;
     --parallel)   shift; [[ "$1" =~ ^[0-9]+$ ]] && PARALLEL="$1" ;;
+    --update)     DO_SELF_UPDATE=true ;;
+    --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
+    --force)      FORCE=true ;;
     esac
     shift
 done
