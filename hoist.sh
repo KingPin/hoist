@@ -142,6 +142,7 @@ _semver_gt() {
 _self_update_notify() {
     local new_ver="$1" release_url="$2"
     if [[ -n $GLOBAL_DISCORD_WEBHOOK ]]; then
+        validate_webhook_url "$GLOBAL_DISCORD_WEBHOOK" || return 1
         local payload
         payload=$(jq -n \
             --arg title "Hoist update available: v${new_ver}" \
@@ -154,18 +155,20 @@ _self_update_notify() {
               "username":"Hoist"}')
         curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" "$GLOBAL_DISCORD_WEBHOOK" 2>/dev/null || true
+            -d "$payload" -- "$GLOBAL_DISCORD_WEBHOOK" 2>/dev/null || true
     fi
     if [[ -n $GLOBAL_SLACK_WEBHOOK ]]; then
+        validate_webhook_url "$GLOBAL_SLACK_WEBHOOK" || return 1
         local payload
         payload=$(jq -n \
             --arg t "Hoist v${new_ver} available (current: v${HOIST_VERSION}). Run --update to upgrade. ${release_url}" \
             '{"text":$t}')
         curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" "$GLOBAL_SLACK_WEBHOOK" 2>/dev/null || true
+            -d "$payload" -- "$GLOBAL_SLACK_WEBHOOK" 2>/dev/null || true
     fi
     if [[ -n $GLOBAL_GENERIC_WEBHOOK ]]; then
+        validate_webhook_url "$GLOBAL_GENERIC_WEBHOOK" || return 1
         local payload
         payload=$(jq -n \
             --arg type "self_update_available" \
@@ -176,16 +179,17 @@ _self_update_notify() {
             '{"type":$type,"current_version":$cur,"new_version":$new,"release_url":$url,"timestamp":$ts}')
         curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" "$GLOBAL_GENERIC_WEBHOOK" 2>/dev/null || true
+            -d "$payload" -- "$GLOBAL_GENERIC_WEBHOOK" 2>/dev/null || true
     fi
 }
 
 _self_update_apply() {
     local new_ver="$1" asset_url="$2" sha256_url="$3" silent="${4:-false}"
     local script_path
-    script_path=$(readlink -f "$0")
+    script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null)
+    [[ -z $script_path ]] && script_path=$(cd "$(dirname "$0")" && echo "$(pwd)/$(basename "$0")")
 
-    [[ -f "$script_path" && "$script_path" == *.sh ]] || {
+    [[ -f $script_path ]] || {
         log "Error: cannot resolve script path for self-update: $script_path"
         exit 1
     }
@@ -217,7 +221,7 @@ _self_update_apply() {
     chmod +x "$tmp_script"
     mv "$tmp_script" "$script_path" || { log "Error: mv failed — update aborted"; exit 1; }
     log "Updated to v${new_ver}. Restart hoist to use the new version."
-    rm -f "${CACHE_LOCATION}/hoist-self-v${new_ver}.notified"
+    rm -f "$tmp_sha256" "${CACHE_LOCATION}/hoist-self-v${new_ver}.notified"
     trap - EXIT
 }
 
@@ -249,6 +253,14 @@ _self_update_check() {
     release_url=$(jq -r '.html_url // empty' <<< "$api_response")
     asset_url=$(jq -r '.assets[] | select(.name == "hoist.sh") | .browser_download_url' <<< "$api_response")
     sha256_url=$(jq -r '.assets[] | select(.name == "hoist.sh.sha256") | .browser_download_url' <<< "$api_response")
+    if [[ -z $asset_url || -z $sha256_url ]]; then
+        if [[ $interactive == true ]]; then
+            log "Error: release v${latest_version} is missing hoist.sh or hoist.sh.sha256 assets"
+            exit 1
+        fi
+        [[ $VERBOSE == true ]] && log "Update v${latest_version} skipped — release assets not found"
+        return 0
+    fi
 
     if ! _semver_gt "$latest_version" "$HOIST_VERSION"; then
         if [[ $interactive == true ]]; then log "Already up to date (v${HOIST_VERSION})"; exit 0; fi
@@ -256,15 +268,17 @@ _self_update_check() {
         return 0
     fi
 
+    local sentinel="${CACHE_LOCATION}/hoist-self-v${latest_version}.notified"
+
+    if [[ $interactive == false && -f $sentinel ]]; then
+        [[ $VERBOSE == true ]] && log "Update notification already sent for v${latest_version}"
+        return 0
+    fi
+
     log "hoist v${latest_version} available (current: v${HOIST_VERSION}) — run with --update to upgrade"
     log "  Release: ${release_url}"
 
     if [[ $interactive == false ]]; then
-        local sentinel="${CACHE_LOCATION}/hoist-self-v${latest_version}.notified"
-        if [[ -f $sentinel ]]; then
-            [[ $VERBOSE == true ]] && log "Update notification already sent for v${latest_version}"
-            return 0
-        fi
         _self_update_notify "$latest_version" "$release_url"
         ( umask 177 && printf '%s' "$latest_version" > "$sentinel" )
         if [[ $UPDATE_CHECK == "update" ]]; then
@@ -277,7 +291,7 @@ _self_update_check() {
     if [[ $DRY_RUN == true ]]; then
         log "[dry-run] would download: $asset_url"
         log "[dry-run] would verify SHA256 from: $sha256_url"
-        log "[dry-run] would replace: $(readlink -f "$0")"
+        log "[dry-run] would replace: $(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
         exit 0
     fi
 
