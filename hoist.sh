@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+HOIST_VERSION="1.0.0"
+HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
 CACHE_LOCATION=/tmp
@@ -13,6 +15,9 @@ GLOBAL_GENERIC_WEBHOOK=""
 MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
+UPDATE_CHECK="${UPDATE_CHECK:-notify}"
+DO_SELF_UPDATE=false
+FORCE=false
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -38,6 +43,9 @@ while [[ "$1" != "" ]]; do
     --tag)        shift; [[ -n "$1" && "$1" != "--"* ]] && TAG=".$1" ;;
     --parallel=*) val="${1#*=}"; [[ $val =~ ^[0-9]+$ ]] && PARALLEL=$val ;;
     --parallel)   shift; [[ "$1" =~ ^[0-9]+$ ]] && PARALLEL="$1" ;;
+    --update)     DO_SELF_UPDATE=true ;;
+    --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
+    --force)      FORCE=true ;;
     esac
     shift
 done
@@ -61,6 +69,7 @@ setup_environment() {
         export -f process_container compose_pull_wrapper compose_up_wrapper log
         export -f send_discord_notification send_generic_webhook send_slack_notification
         export -f check_maintenance_window validate_webhook_url validate_script_path
+        export -f _semver_gt _self_update_notify _self_update_apply _self_update_check
     fi
 }
 
@@ -109,6 +118,209 @@ validate_script_path() {
     [[ -z "$path" ]] && return 0
     [[ "$path" == /* ]] || { log "SECURITY: script path must be absolute: $path"; return 1; }
     [[ -x "$path" ]] || { log "SECURITY: script path is not executable: $path"; return 1; }
+}
+
+_semver_gt() {
+    local IFS=.
+    local -a a=($1) b=($2)
+    for i in 0 1 2; do
+        local av=${a[i]:-0} bv=${b[i]:-0}
+        av=${av%%[!0-9]*}   # strip pre-release suffix (e.g. "1-rc.1" -> "1")
+        bv=${bv%%[!0-9]*}
+        [[ $av -gt $bv ]] && return 0
+        [[ $av -lt $bv ]] && return 1
+    done
+    return 1
+}
+
+_self_update_notify() {
+    local new_ver="$1" release_url="$2"
+    local payload
+    if [[ -n $GLOBAL_DISCORD_WEBHOOK ]]; then
+        payload=$(jq -n \
+            --arg title "Hoist update available: v${new_ver}" \
+            --arg url "$release_url" \
+            --arg cur "$HOIST_VERSION" \
+            '{"embeds":[{"title":$title,
+               "description":("Current: v" + $cur + "\nRun `hoist --update` to upgrade"),
+               "url":$url,"color":16776960,
+               "footer":{"text":"Powered by Hoist"}}],
+              "username":"Hoist"}') || {
+            [[ $VERBOSE == true ]] && log "Warning: failed to build Discord payload for self-update notify"
+        }
+        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+            -d "$payload" -- "$GLOBAL_DISCORD_WEBHOOK" 2>/dev/null || \
+            { [[ $VERBOSE == true ]] && log "Warning: Discord self-update notification failed"; }
+    fi
+    if [[ -n $GLOBAL_SLACK_WEBHOOK ]]; then
+        payload=$(jq -n \
+            --arg t "Hoist v${new_ver} available (current: v${HOIST_VERSION}). Run --update to upgrade. ${release_url}" \
+            '{"text":$t}') || {
+            [[ $VERBOSE == true ]] && log "Warning: failed to build Slack payload for self-update notify"
+        }
+        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+            -d "$payload" -- "$GLOBAL_SLACK_WEBHOOK" 2>/dev/null || \
+            { [[ $VERBOSE == true ]] && log "Warning: Slack self-update notification failed"; }
+    fi
+    if [[ -n $GLOBAL_GENERIC_WEBHOOK ]]; then
+        payload=$(jq -n \
+            --arg type "self_update_available" \
+            --arg cur "$HOIST_VERSION" \
+            --arg new "$new_ver" \
+            --arg url "$release_url" \
+            --arg ts "$(date -u +'%FT%T.%3NZ')" \
+            '{"type":$type,"current_version":$cur,"new_version":$new,"release_url":$url,"timestamp":$ts}') || {
+            [[ $VERBOSE == true ]] && log "Warning: failed to build generic payload for self-update notify"
+        }
+        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+            -d "$payload" -- "$GLOBAL_GENERIC_WEBHOOK" 2>/dev/null || \
+            { [[ $VERBOSE == true ]] && log "Warning: generic self-update notification failed"; }
+    fi
+}
+
+_self_update_apply() {
+    local new_ver="$1" asset_url="$2" sha256_url="$3" silent="${4:-false}"
+    local script_path
+    script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null)
+    [[ -z $script_path ]] && script_path=$(cd "$(dirname "$0")" && echo "$(pwd)/$(basename "$0")")
+
+    [[ -f $script_path ]] || {
+        log "Error: cannot resolve script path for self-update: $script_path"
+        return 1
+    }
+    [[ -w $script_path ]] || { log "Error: $script_path is not writable — cannot self-update"; return 1; }
+
+    local tmp_script tmp_sha256
+    tmp_script=$(mktemp /tmp/hoist-update-XXXXXX) || {
+        log "Error: cannot create temp file for update download"
+        return 1
+    }
+    tmp_sha256=$(mktemp /tmp/hoist-update-XXXXXX.sha256) || {
+        log "Error: cannot create temp file for SHA256"
+        rm -f "$tmp_script"
+        return 1
+    }
+
+    _suu_cleanup() { rm -f "$tmp_script" "$tmp_sha256"; }
+
+    [[ $silent == false ]] && log "Downloading hoist.sh v${new_ver}..."
+    curl -fsSL --max-time 60 --connect-timeout 10 \
+        -H "User-Agent: Hoist/${HOIST_VERSION}" \
+        -o "$tmp_script" "$asset_url" || {
+        log "Error: failed to download hoist v${new_ver} from ${asset_url}"
+        _suu_cleanup; return 1
+    }
+
+    [[ $silent == false ]] && log "Downloading SHA256 checksum..."
+    curl -fsSL --max-time 10 --connect-timeout 5 \
+        -H "User-Agent: Hoist/${HOIST_VERSION}" \
+        -o "$tmp_sha256" "$sha256_url" || {
+        log "Error: failed to download SHA256 for hoist v${new_ver} from ${sha256_url}"
+        _suu_cleanup; return 1
+    }
+
+    local expected_hash actual_hash
+    expected_hash=$(awk '{print $1}' "$tmp_sha256")
+    [[ $expected_hash =~ ^[0-9a-f]{64}$ ]] || {
+        log "Error: malformed SHA256 file (got: '${expected_hash}')"
+        _suu_cleanup; return 1
+    }
+    actual_hash=$(sha256sum "$tmp_script" | awk '{print $1}')
+    if [[ $expected_hash != "$actual_hash" ]]; then
+        log "Error: SHA256 mismatch — aborting update (expected: ${expected_hash}, got: ${actual_hash})"
+        _suu_cleanup; return 1
+    fi
+
+    chmod +x "$tmp_script"
+    mv "$tmp_script" "$script_path" || { log "Error: mv failed — update aborted"; _suu_cleanup; return 1; }
+    log "Updated to v${new_ver}. Restart hoist to use the new version."
+    rm -f "$tmp_sha256" "${CACHE_LOCATION}/hoist-self-v${new_ver}.notified"
+}
+
+_self_update_check() {
+    local interactive="${1:-false}"
+    local force="${2:-false}"
+    local timeout_arg=5
+    [[ $interactive == true ]] && timeout_arg=15
+
+    local api_response
+    api_response=$(curl -fsSL \
+        --max-time "$timeout_arg" --connect-timeout 5 \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -H "User-Agent: Hoist/${HOIST_VERSION}" \
+        "https://api.github.com/repos/${HOIST_REPO}/releases/latest" 2>/dev/null) || {
+        if [[ $interactive == true ]]; then log "Error: could not reach GitHub API"; exit 1; fi
+        [[ $VERBOSE == true ]] && log "Self-update check failed (network), skipping"
+        return 0
+    }
+
+    local latest_tag latest_version release_url asset_url sha256_url
+    latest_tag=$(jq -r '.tag_name // empty' <<< "$api_response")
+    [[ -z $latest_tag ]] && {
+        if [[ $interactive == true ]]; then log "Error: malformed API response"; exit 1; fi
+        return 0
+    }
+    latest_version="${latest_tag#v}"
+    release_url=$(jq -r '.html_url // empty' <<< "$api_response")
+    [[ -z $release_url ]] && release_url="https://github.com/${HOIST_REPO}/releases/tag/v${latest_version}"
+    asset_url=$(jq -r '.assets[] | select(.name == "hoist.sh") | .browser_download_url' <<< "$api_response")
+    sha256_url=$(jq -r '.assets[] | select(.name == "hoist.sh.sha256") | .browser_download_url' <<< "$api_response")
+    if [[ -z $asset_url || -z $sha256_url ]]; then
+        if [[ $interactive == true ]]; then
+            log "Error: release v${latest_version} is missing hoist.sh or hoist.sh.sha256 assets"
+            exit 1
+        fi
+        [[ $VERBOSE == true ]] && log "Update v${latest_version} skipped — release assets not found"
+        return 0
+    fi
+
+    if ! _semver_gt "$latest_version" "$HOIST_VERSION"; then
+        if [[ $interactive == true ]]; then log "Already up to date (v${HOIST_VERSION})"; exit 0; fi
+        [[ $VERBOSE == true ]] && log "hoist is up to date (v${HOIST_VERSION})"
+        return 0
+    fi
+
+    local sentinel="${CACHE_LOCATION}/hoist-self-v${latest_version}.notified"
+
+    # Sentinel suppresses repeat notifications on automated runs; --update (interactive) always proceeds
+    if [[ $interactive == false && -f $sentinel ]]; then
+        [[ $VERBOSE == true ]] && log "Update notification already sent for v${latest_version}"
+        return 0
+    fi
+
+    log "hoist v${latest_version} available (current: v${HOIST_VERSION}) — run with --update to upgrade"
+    log "  Release: ${release_url}"
+
+    if [[ $interactive == false ]]; then
+        _self_update_notify "$latest_version" "$release_url"
+        ( umask 177 && printf '%s' "$latest_version" > "$sentinel" ) || \
+            log "Warning: could not write update sentinel ${sentinel} — notifications may repeat"
+        if [[ $UPDATE_CHECK == "update" ]]; then
+            log "UPDATE_CHECK=update — applying automatically"
+            _self_update_apply "$latest_version" "$asset_url" "$sha256_url" true || \
+                log "Auto-update to v${latest_version} failed — continuing container management"
+        fi
+        return 0
+    fi
+
+    if [[ $DRY_RUN == true ]]; then
+        log "[dry-run] would download: $asset_url"
+        log "[dry-run] would verify SHA256 from: $sha256_url"
+        log "[dry-run] would replace: $(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+        exit 0
+    fi
+
+    if [[ $force == false ]]; then
+        read -rp "Update now? [y/N] " _answer
+        [[ ${_answer,,} == y ]] || { log "Update cancelled."; exit 0; }
+    fi
+
+    _self_update_apply "$latest_version" "$asset_url" "$sha256_url" false || exit 1
+    exit 0
 }
 
 send_discord_notification() {
@@ -375,6 +587,14 @@ process_container() {
 }
 
 trap 'exit 130' INT
+
+if [[ $DO_SELF_UPDATE == true ]]; then
+    _self_update_check true "$FORCE"
+fi
+
+if [[ $UPDATE_CHECK != "off" ]]; then
+    _self_update_check false false
+fi
 
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
