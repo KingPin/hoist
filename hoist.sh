@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+HOIST_VERSION="1.0.0"
+HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
 CACHE_LOCATION=/tmp
