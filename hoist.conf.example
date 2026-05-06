@@ -41,4 +41,7 @@
 #   notify — print to console + send to configured webhooks if a newer version exists
 #   update — automatically apply updates (no prompt); still fires configured webhooks before applying
 #   off    — never check for updates during normal runs
+# WARNING: avoid "update" when running via cron — the script silently replaces itself on disk and
+#          any breaking change in the new version will affect every subsequent unattended run.
+#          Use "notify" (default) to receive alerts and apply updates manually instead.
 # UPDATE_CHECK="notify"
