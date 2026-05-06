@@ -15,6 +15,7 @@ GLOBAL_GENERIC_WEBHOOK=""
 MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
+UPDATE_CHECK="${UPDATE_CHECK:-notify}"
 
 log() {
     local msg="[$(date +%T)] $*"

@@ -36,3 +36,9 @@
 # GLOBAL_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
 # GLOBAL_SLACK_WEBHOOK=https://hooks.slack.com/services/...
 # GLOBAL_GENERIC_WEBHOOK=https://example.com/webhook
+
+# Self-update behavior on every run: "notify", "update", or "off" (default: notify)
+#   notify — print to console + send to configured webhooks if a newer version exists
+#   update — silently apply updates automatically (no prompt)
+#   off    — never check for updates during normal runs
+# UPDATE_CHECK="notify"
