@@ -100,7 +100,7 @@ verify_targets=("hoist.sh")
 for f in "${verify_targets[@]}"; do
     expected=$(awk '{print $1}' "${tmp}/${f}.sha256")
     [[ $expected =~ ^[0-9a-f]{64}$ ]] || err "malformed SHA256 for ${f}"
-    actual=$(_sha256 "${tmp}/${f}")
+    actual=$(_sha256 "${tmp}/${f}") || err "cannot compute SHA256 for ${f}"
     [[ $expected == "$actual" ]] || err "SHA256 mismatch for ${f} (expected ${expected}, got ${actual})"
 done
 

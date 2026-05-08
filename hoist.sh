@@ -287,7 +287,10 @@ _self_update_apply() {
         log "Error: malformed SHA256 file (got: '${expected_hash}')"
         _suu_cleanup; return 1
     }
-    actual_hash=$(_sha256 "$tmp_script")
+    actual_hash=$(_sha256 "$tmp_script") || {
+        log "Error: cannot compute SHA256 (no sha256sum or shasum available)"
+        _suu_cleanup; return 1
+    }
     if [[ $expected_hash != "$actual_hash" ]]; then
         log "Error: SHA256 mismatch — aborting update (expected: ${expected_hash}, got: ${actual_hash})"
         _suu_cleanup; return 1
