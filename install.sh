@@ -130,6 +130,12 @@ info "Hoist installed successfully."
 "${INSTALL_DIR}/hoist" --version 2>/dev/null || true
 echo
 echo "Next steps:"
-echo "  - Review/edit ${CONFIG_DIR}/hoist.conf"
+if [[ $have_conf == true ]]; then
+    echo "  - Review/edit ${CONFIG_DIR}/hoist.conf"
+else
+    echo "  - This release didn't ship hoist.conf.example as an asset; grab it from"
+    echo "    https://github.com/${HOIST_REPO}/blob/master/hoist.conf.example and place it at"
+    echo "    ${CONFIG_DIR}/hoist.conf if you want a system-wide config"
+fi
 echo "  - Add com.sumguy.hoist.* labels to containers you want managed"
 echo "  - Docs: https://github.com/${HOIST_REPO}#usage"
