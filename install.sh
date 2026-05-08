@@ -49,7 +49,6 @@ _sudo_if_needed() {
     fi
 }
 
-# Dependencies
 command -v curl >/dev/null 2>&1 || err "curl is required"
 command -v docker >/dev/null 2>&1 || warn "docker not found — install it before running hoist"
 command -v jq     >/dev/null 2>&1 || warn "jq not found — install it before running hoist"
@@ -60,7 +59,6 @@ if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
     warn "         (e.g. /opt/homebrew/bin or /usr/local/bin). Verify with: bash --version"
 fi
 
-# Resolve URL prefix
 if [[ -n $HOIST_VERSION ]]; then
     url_prefix="https://github.com/${HOIST_REPO}/releases/download/${HOIST_VERSION}"
     info "Installing hoist ${HOIST_VERSION}"
@@ -103,7 +101,6 @@ _fetch hoist.sh.sha256
 _fetch hoist.conf.example         true || have_conf=false
 [[ $have_conf == true ]] && { _fetch hoist.conf.example.sha256 true || have_conf=false; }
 
-# Verify checksums
 info "Verifying checksums"
 verify_targets=("hoist.sh")
 [[ $have_conf == true ]] && verify_targets+=("hoist.conf.example")
@@ -114,12 +111,10 @@ for f in "${verify_targets[@]}"; do
     [[ $expected == "$actual" ]] || err "SHA256 mismatch for ${f} (expected ${expected}, got ${actual})"
 done
 
-# Install binary
 info "Installing binary to ${INSTALL_DIR}/hoist"
 _sudo_if_needed "$INSTALL_DIR" mkdir -p "$INSTALL_DIR"
 _sudo_if_needed "${INSTALL_DIR}/hoist" install -m 0755 "${tmp}/hoist.sh" "${INSTALL_DIR}/hoist"
 
-# Install config (only if the example was published in this release)
 if [[ $have_conf == true ]]; then
     info "Installing config to ${CONFIG_DIR}/"
     _sudo_if_needed "$CONFIG_DIR" mkdir -p "$CONFIG_DIR"
