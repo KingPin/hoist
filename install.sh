@@ -55,7 +55,9 @@ command -v docker >/dev/null 2>&1 || warn "docker not found — install it befor
 command -v jq     >/dev/null 2>&1 || warn "jq not found — install it before running hoist"
 
 if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    warn "hoist requires bash 4+ at runtime (current: ${BASH_VERSION:-unknown}). On macOS: brew install bash"
+    warn "hoist requires bash 4+ at runtime (current: ${BASH_VERSION:-unknown})."
+    warn "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH"
+    warn "         (e.g. /opt/homebrew/bin or /usr/local/bin). Verify with: bash --version"
 fi
 
 # Resolve URL prefix

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown}). On macOS: brew install bash" >&2
+    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+    echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
+    echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
+    echo "  Verify with: bash --version" >&2
     exit 1
 fi
 HOIST_VERSION="1.2.0"
