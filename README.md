@@ -28,6 +28,9 @@ CLI flags always override config file values.
 | `GLOBAL_SLACK_WEBHOOK` | _(none)_ | Fallback Slack webhook |
 | `GLOBAL_GENERIC_WEBHOOK` | _(none)_ | Fallback generic webhook |
 | `MAINTENANCE_WINDOW` | _(none)_ | Only run during this time window (e.g. `02:00-06:00`). Midnight-spanning works: `22:00-04:00`. Dry-run bypasses this. |
+| `VERBOSE` | `false` | Log containers skipped due to missing hoist labels. Auto-enabled by `--dry-run`. |
+| `CURL_TIMEOUT` | `30` | Maximum time in seconds for webhook HTTP requests. |
+| `UPDATE_CHECK` | `notify` | Self-update behavior on every run: `notify` (log + webhook alert), `update` (auto-apply new releases), or `off`. See [Self-update](#self-update). |
 
 Global webhooks fire for any container with `update` or `notify` enabled that has no per-container webhook label. Per-container labels always take precedence.
 
@@ -54,9 +57,14 @@ bash hoist.sh [options]
 | Flag | Description |
 |---|---|
 | `--tag <value>` | Use a label subset (e.g. `--tag nightly` reads `com.sumguy.hoist.nightly.*` labels) |
-| `--dry-run` | Show what would be updated without pulling, recreating, or notifying |
+| `--dry-run` | Show what would be updated without pulling, recreating, or notifying (implies `--verbose`) |
+| `--verbose` | Log containers skipped because they have no hoist labels |
 | `--parallel <N>` | Process containers concurrently with `N` workers |
 | `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
+| `--update` | Self-update hoist to the latest GitHub release (interactive — prompts before replacing) |
+| `--force` | With `--update`, skip the confirmation prompt and reinstall even if already up to date |
+| `--version` | Print version and exit |
+| `-h`, `--help`, `-?` | Show help and exit |
 
 After every run, hoist prints a one-line summary:
 
@@ -135,6 +143,24 @@ When `script.update` or `script.notify` fires, these environment variables are a
 | Container never updates despite new image | Label typo or wrong tag | Check label spelling; if using `--tag nightly`, labels must be `com.sumguy.hoist.nightly.*` |
 | Notifications fire every run | `CACHE_LOCATION` is cleaned between runs (e.g. tmpfs) | Set `CACHE_LOCATION` to a persistent path |
 | Script runs but exits immediately | `MAINTENANCE_WINDOW` set and current time is outside it | Expected behavior — adjust window or run with `--dry-run` to bypass |
+
+## Self-update
+
+On every run, hoist checks the GitHub releases API for a newer version. Behavior is controlled by `UPDATE_CHECK`:
+
+- **`notify`** (default) — logs a message and fires global webhooks (Discord/Slack/generic) once per new version, then continues normal operation. A sentinel file in `CACHE_LOCATION` suppresses repeat notifications for the same version.
+- **`update`** — automatically downloads, SHA256-verifies, and replaces the script on disk. Webhooks still fire before the update is applied. **Avoid this on cron** — a breaking release will affect every subsequent unattended run.
+- **`off`** — skips the check entirely.
+
+To trigger an interactive update manually:
+
+```bash
+hoist --update            # prompts before replacing
+hoist --update --force    # skip prompt, reinstall even if up to date
+hoist --update --dry-run  # show what would be downloaded, then exit
+```
+
+Updates require write access to the running script path. The downloaded asset is verified against `hoist.sh.sha256` from the same release before any replacement happens.
 
 ## Running on a schedule
 
