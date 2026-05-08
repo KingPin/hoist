@@ -397,6 +397,8 @@ process_container() {
     local container_name="$1"
     local safe_name
     safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
+    local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
+    local -a _tokens=()
     log "$container_name: Checking..."
 
     local inspect
@@ -484,6 +486,8 @@ process_container() {
         if [[ $DRY_RUN == true ]]; then
             log "$container_name: [dry-run] would pull image"
             image_digest="$container_image_digest"
+            [[ $hoist_update == true ]] && _tokens+=("would_update")
+            [[ $hoist_notify == true ]] && _tokens+=("would_notify")
         else
             log "$container_name: Pulling image..."
             compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
@@ -532,11 +536,13 @@ process_container() {
                     status="✅ Update succeeded"
                     status_generic="update_success"
                     color=3066993
+                    _tokens+=("updated")
                 else
                     log "$container_name: Update failed"
                     status="❌ Update failed"
                     status_generic="update_failure"
                     color=15158332
+                    _tokens+=("update_failed")
                 fi
                 rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
@@ -579,11 +585,47 @@ process_container() {
                     send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
                 fi
                 ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
+                _tokens+=("notified")
             fi
         fi
     else
         [[ $VERBOSE == true ]] && log "$container_name: Skipped (no hoist labels)"
+        _tokens+=("skipped")
     fi
+    if [[ ${#_tokens[@]} -eq 0 ]]; then
+        _tokens+=("no_change")
+    fi
+    printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+}
+
+print_summary() {
+    local updated=0 update_failed=0 notified=0 no_change=0 skipped=0
+    local would_update=0 would_notify=0
+    local f token
+    for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
+        [[ -f $f ]] || continue
+        while IFS= read -r token; do
+            case "$token" in
+                updated)       (( updated++ )) ;;
+                update_failed) (( update_failed++ )) ;;
+                notified)      (( notified++ )) ;;
+                no_change)     (( no_change++ )) ;;
+                skipped)       (( skipped++ )) ;;
+                would_update)  (( would_update++ )) ;;
+                would_notify)  (( would_notify++ )) ;;
+            esac
+        done < "$f"
+    done
+
+    local msg
+    if [[ $DRY_RUN == true ]]; then
+        msg="Run complete (dry-run): ${would_update} would update, ${would_notify} would notify, ${no_change} no-change, ${skipped} skipped"
+    else
+        local updated_part="${updated} updated"
+        [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
+        msg="Run complete: ${updated_part}, ${notified} notified, ${no_change} no-change, ${skipped} skipped"
+    fi
+    log "$msg"
 }
 
 trap 'exit 130' INT
@@ -598,6 +640,7 @@ fi
 
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
+rm -f "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null || true
 setup_environment
 check_maintenance_window
 
@@ -610,6 +653,8 @@ else
         process_container "$container_name"
     done
 fi
+
+print_summary
 
 if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     log "Pruning docker images..."
