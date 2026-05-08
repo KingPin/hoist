@@ -274,17 +274,34 @@ _self_update_check() {
     local timeout_arg=5
     [[ $interactive == true ]] && timeout_arg=15
 
-    local api_response
-    api_response=$(curl -fsSL \
+    local api_response _api_raw _http_code
+    _api_raw=$(curl -sSL -w '\n%{http_code}' \
         --max-time "$timeout_arg" --connect-timeout 5 \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -H "User-Agent: Hoist/${HOIST_VERSION}" \
-        "https://api.github.com/repos/${HOIST_REPO}/releases/latest" 2>/dev/null) || {
-        if [[ $interactive == true ]]; then log "Error: could not reach GitHub API"; exit 1; fi
+        "https://api.github.com/repos/${HOIST_REPO}/releases/latest" 2>/dev/null)
+    _http_code="${_api_raw##*$'\n'}"
+    api_response="${_api_raw%$'\n'*}"
+
+    if [[ $_http_code == 000 || -z $_http_code ]]; then
+        if [[ $interactive == true ]]; then log "Error: could not reach GitHub API (network failure or timeout)"; exit 1; fi
         [[ $VERBOSE == true ]] && log "Self-update check failed (network), skipping"
         return 0
-    }
+    fi
+    if [[ $_http_code == 404 ]]; then
+        if [[ $interactive == true ]]; then
+            log "Error: no releases published yet for ${HOIST_REPO} — see https://github.com/${HOIST_REPO}/releases"
+            exit 1
+        fi
+        [[ $VERBOSE == true ]] && log "Self-update: no releases published for ${HOIST_REPO}, skipping"
+        return 0
+    fi
+    if [[ $_http_code != 200 ]]; then
+        if [[ $interactive == true ]]; then log "Error: GitHub API returned HTTP ${_http_code}"; exit 1; fi
+        [[ $VERBOSE == true ]] && log "Self-update: GitHub API returned HTTP ${_http_code}, skipping"
+        return 0
+    fi
 
     local latest_tag latest_version release_url asset_url sha256_url
     latest_tag=$(jq -r '.tag_name // empty' <<< "$api_response")
