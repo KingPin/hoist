@@ -73,25 +73,34 @@ fi
 tmp=$(mktemp -d -t hoist.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/hoist.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-# Download release assets. hoist.sh is required; hoist.conf.example is best-effort
-# so the installer still works against releases that predate the conf.example asset.
+# hoist.sh is required; hoist.conf.example is best-effort so the installer still
+# works against releases that predate the conf.example asset. We use -w to
+# distinguish HTTP 404 (asset genuinely missing) from network/proxy/DNS errors.
+_fetch() {
+    local asset="$1" optional="${2:-false}" http
+    http=$(curl -sS --max-time 60 --connect-timeout 10 \
+        -H "User-Agent: hoist-installer" \
+        -w '%{http_code}' \
+        -o "${tmp}/${asset}" "${url_prefix}/${asset}" 2>/dev/null) || http="000"
+    case "$http" in
+        200) return 0 ;;
+        000) err "network failure downloading ${asset} (timeout, DNS, or connection refused)" ;;
+        404)
+            if [[ $optional == true ]]; then
+                warn "release does not include ${asset} — skipping config seeding"
+                return 1
+            fi
+            err "release asset ${asset} not found at ${url_prefix}/" ;;
+        *) err "HTTP ${http} downloading ${asset} from ${url_prefix}/" ;;
+    esac
+}
+
 have_conf=true
 info "Downloading release assets from ${url_prefix}/"
-for asset in hoist.sh hoist.sh.sha256; do
-    curl -fsSL --max-time 60 --connect-timeout 10 \
-        -H "User-Agent: hoist-installer" \
-        -o "${tmp}/${asset}" "${url_prefix}/${asset}" \
-        || err "failed to download ${asset}"
-done
-for asset in hoist.conf.example hoist.conf.example.sha256; do
-    if ! curl -fsSL --max-time 60 --connect-timeout 10 \
-        -H "User-Agent: hoist-installer" \
-        -o "${tmp}/${asset}" "${url_prefix}/${asset}"; then
-        warn "release does not include ${asset} — skipping config seeding"
-        have_conf=false
-        break
-    fi
-done
+_fetch hoist.sh
+_fetch hoist.sh.sha256
+_fetch hoist.conf.example         true || have_conf=false
+[[ $have_conf == true ]] && { _fetch hoist.conf.example.sha256 true || have_conf=false; }
 
 # Verify checksums
 info "Verifying checksums"
