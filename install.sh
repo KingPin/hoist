@@ -65,18 +65,31 @@ fi
 tmp=$(mktemp -d -t hoist.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/hoist.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-# Download release assets
+# Download release assets. hoist.sh is required; hoist.conf.example is best-effort
+# so the installer still works against releases that predate the conf.example asset.
+have_conf=true
 info "Downloading release assets from ${url_prefix}/"
-for asset in hoist.sh hoist.sh.sha256 hoist.conf.example hoist.conf.example.sha256; do
+for asset in hoist.sh hoist.sh.sha256; do
     curl -fsSL --max-time 60 --connect-timeout 10 \
         -H "User-Agent: hoist-installer" \
         -o "${tmp}/${asset}" "${url_prefix}/${asset}" \
         || err "failed to download ${asset}"
 done
+for asset in hoist.conf.example hoist.conf.example.sha256; do
+    if ! curl -fsSL --max-time 60 --connect-timeout 10 \
+        -H "User-Agent: hoist-installer" \
+        -o "${tmp}/${asset}" "${url_prefix}/${asset}"; then
+        warn "release does not include ${asset} — skipping config seeding"
+        have_conf=false
+        break
+    fi
+done
 
 # Verify checksums
 info "Verifying checksums"
-for f in hoist.sh hoist.conf.example; do
+verify_targets=("hoist.sh")
+[[ $have_conf == true ]] && verify_targets+=("hoist.conf.example")
+for f in "${verify_targets[@]}"; do
     expected=$(awk '{print $1}' "${tmp}/${f}.sha256")
     [[ $expected =~ ^[0-9a-f]{64}$ ]] || err "malformed SHA256 for ${f}"
     actual=$(_sha256 "${tmp}/${f}")
@@ -88,18 +101,20 @@ info "Installing binary to ${INSTALL_DIR}/hoist"
 _sudo_if_needed "$INSTALL_DIR" mkdir -p "$INSTALL_DIR"
 _sudo_if_needed "${INSTALL_DIR}/hoist" install -m 0755 "${tmp}/hoist.sh" "${INSTALL_DIR}/hoist"
 
-# Install config
-info "Installing config to ${CONFIG_DIR}/"
-_sudo_if_needed "$CONFIG_DIR" mkdir -p "$CONFIG_DIR"
-_sudo_if_needed "${CONFIG_DIR}/hoist.conf.example" \
-    install -m 0644 "${tmp}/hoist.conf.example" "${CONFIG_DIR}/hoist.conf.example"
+# Install config (only if the example was published in this release)
+if [[ $have_conf == true ]]; then
+    info "Installing config to ${CONFIG_DIR}/"
+    _sudo_if_needed "$CONFIG_DIR" mkdir -p "$CONFIG_DIR"
+    _sudo_if_needed "${CONFIG_DIR}/hoist.conf.example" \
+        install -m 0644 "${tmp}/hoist.conf.example" "${CONFIG_DIR}/hoist.conf.example"
 
-if [[ ! -e "${CONFIG_DIR}/hoist.conf" ]]; then
-    info "Seeding ${CONFIG_DIR}/hoist.conf from example"
-    _sudo_if_needed "${CONFIG_DIR}/hoist.conf" \
-        install -m 0644 "${tmp}/hoist.conf.example" "${CONFIG_DIR}/hoist.conf"
-else
-    info "${CONFIG_DIR}/hoist.conf already exists — leaving untouched"
+    if [[ ! -e "${CONFIG_DIR}/hoist.conf" ]]; then
+        info "Seeding ${CONFIG_DIR}/hoist.conf from example"
+        _sudo_if_needed "${CONFIG_DIR}/hoist.conf" \
+            install -m 0644 "${tmp}/hoist.conf.example" "${CONFIG_DIR}/hoist.conf"
+    else
+        info "${CONFIG_DIR}/hoist.conf already exists — leaving untouched"
+    fi
 fi
 
 echo
