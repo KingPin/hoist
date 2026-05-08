@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
-    echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
-    echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
-    echo "  Verify with: bash --version" >&2
-    exit 1
-fi
 HOIST_VERSION="1.2.0"
 HOIST_REPO="KingPin/hoist"
 
@@ -84,6 +77,16 @@ EOF
     esac
     shift
 done
+
+# Bash 4+ check runs after arg parse so --version/--help still work on macOS
+# system bash 3.2 — users need a way to diagnose what they have installed.
+if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+    echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
+    echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
+    echo "  Verify with: bash --version" >&2
+    exit 1
+fi
 
 [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
 
