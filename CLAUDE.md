@@ -15,12 +15,15 @@ There is no build system, no test suite, and no linter configuration. Requires `
 ## Running
 
 ```bash
-bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>]
+bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>] [--list] [--update]
 ```
 
 - `--tag` filters which label set to act on (e.g. `--tag nightly` reads `com.sumguy.hoist.nightly.*` labels)
-- `--dry-run` shows what would be pulled/updated without making any changes or sending notifications
+- `--dry-run` shows what would be pulled/updated without making any changes or sending notifications (implies `--verbose`)
+- `--verbose` logs containers skipped for missing hoist labels
 - `--parallel N` uses `xargs -P N` to process containers concurrently
+- `--list` / `--status` prints a table of running containers + their hoist labels and cached digest, then exits before any pulls
+- `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--version` prints `HOIST_VERSION` and exits
 
 ## Architecture
 
@@ -52,7 +55,25 @@ A container can have both `update` and `notify` set — it will update AND send 
 
 ### Notification deduplication
 
-Notification state is persisted in `/tmp/hoist-<container-name>.notified` — a file containing the last-notified image digest. This prevents re-notifying for the same image version on repeated runs.
+Notification state is persisted in `${CACHE_LOCATION}/hoist-<safe-name>.notified` — a file containing the last-notified image digest. This prevents re-notifying for the same image version on repeated runs. `<safe-name>` is the container name with non-`[:alnum:]._-` characters replaced by `_`.
+
+### Run summary
+
+Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files are wiped at the start of each run.
+
+### Self-update
+
+On every run (unless `UPDATE_CHECK=off`), `_self_update_check` queries the GitHub releases API for `KingPin/hoist`. Three modes:
+
+- `notify` (default): logs availability + fires global webhooks (Discord/Slack/generic) once per new version. A sentinel file `${CACHE_LOCATION}/hoist-self-v<version>.notified` suppresses repeats.
+- `update`: silently downloads, SHA256-verifies against `hoist.sh.sha256`, and atomically replaces the script via `mv`. Webhooks still fire first.
+- `off`: skip entirely.
+
+`--update` invokes the same path interactively (prompts before replacing; `--force` skips the prompt; `--dry-run` shows what would happen without writing). HTTP errors are distinguished: `000` = network failure, `404` = no releases yet, other non-200 = API error.
+
+### List mode
+
+`--list`/`--status` short-circuits after container discovery: it calls `list_containers` (a parallel jq parse + cached-digest lookup) and exits before `setup_environment`, the maintenance-window check, or any pulls.
 
 ### Environment variable injection for custom scripts
 
@@ -62,4 +83,4 @@ When `script.update` or `script.notify` runs, these `HOIST_*` env vars are set:
 
 ### Parallel mode caveat
 
-When `--parallel N` (N > 1) is used, functions and variables are exported via `export -f` so subshells spawned by `xargs` can access them. Any new helper functions added to the script must be added to the `export -f` list in `setup_environment` if they need to work in parallel mode.
+When `--parallel N` (N > 1) is used, functions and variables are exported via `export -f` so subshells spawned by `xargs` can access them. The canonical export list lives in `setup_environment` (hoist.sh) — any new helper function called from `process_container` (or its callees) must be added there, or it will silently break in parallel mode while still working serially.
