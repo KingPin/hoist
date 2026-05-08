@@ -36,6 +36,32 @@ Global webhooks fire for any container with `update` or `notify` enabled that ha
 
 ## Installation
 
+**One-line install** (latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/KingPin/hoist/master/install.sh | bash
+```
+
+> ⚠️ **Always inspect scripts before piping to a shell.** Review first:
+> `curl -fsSL https://raw.githubusercontent.com/KingPin/hoist/master/install.sh | less`
+
+Pin a specific version:
+
+```bash
+HOIST_VERSION=v1.2.0 curl -fsSL https://raw.githubusercontent.com/KingPin/hoist/master/install.sh | bash
+```
+
+Override paths (e.g. install per-user without sudo):
+
+```bash
+INSTALL_DIR=$HOME/.local/bin CONFIG_DIR=$HOME/.config/hoist \
+  curl -fsSL https://raw.githubusercontent.com/KingPin/hoist/master/install.sh | bash
+```
+
+The installer downloads `hoist.sh` and `hoist.conf.example` from the GitHub release, verifies SHA256 checksums, installs the binary to `INSTALL_DIR/hoist`, and seeds `CONFIG_DIR/hoist.conf` from the example only if it doesn't already exist.
+
+**Manual install:**
+
 ```bash
 sudo cp hoist.sh /usr/local/bin/hoist
 sudo chmod +x /usr/local/bin/hoist
@@ -47,6 +73,7 @@ For system-wide config, place `hoist.conf` at `/etc/hoist/hoist.conf`.
 
 - Docker with the `compose` subcommand (`docker compose`)
 - `jq`
+- Bash 4+ (macOS ships 3.2 by default — `brew install bash`)
 
 ## Usage
 

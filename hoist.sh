@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.1.0"
+HOIST_VERSION="1.2.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -78,6 +78,16 @@ EOF
     shift
 done
 
+# Bash 4+ check runs after arg parse so --version/--help still work on macOS
+# system bash 3.2 — users need a way to diagnose what they have installed.
+if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+    echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
+    echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
+    echo "  Verify with: bash --version" >&2
+    exit 1
+fi
+
 [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
 
 for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK; do
@@ -97,7 +107,7 @@ setup_environment() {
         export -f process_container compose_pull_wrapper compose_up_wrapper log
         export -f send_discord_notification send_generic_webhook send_slack_notification
         export -f check_maintenance_window validate_webhook_url validate_script_path
-        export -f _semver_gt _self_update_notify _self_update_apply _self_update_check
+        export -f _semver_gt _self_update_notify _self_update_apply _self_update_check _sha256 _iso_ts
     fi
 }
 
@@ -161,6 +171,30 @@ _semver_gt() {
     return 1
 }
 
+_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "Error: neither sha256sum nor shasum available" >&2
+        return 1
+    fi
+}
+
+_iso_ts() {
+    # %3N is GNU-only; BSD date drops or echoes the literal token, varying by libc.
+    # Validate the result against a strict ISO-8601 millisecond pattern; otherwise
+    # downgrade to second precision so webhook payloads stay parseable.
+    local ts
+    ts=$(date -u +'%FT%T.%3NZ' 2>/dev/null)
+    if [[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
+        printf '%s' "$ts"
+    else
+        date -u +'%FT%TZ'
+    fi
+}
+
 _self_update_notify() {
     local new_ver="$1" release_url="$2"
     local payload
@@ -198,7 +232,7 @@ _self_update_notify() {
             --arg cur "$HOIST_VERSION" \
             --arg new "$new_ver" \
             --arg url "$release_url" \
-            --arg ts "$(date -u +'%FT%T.%3NZ')" \
+            --arg ts "$(_iso_ts)" \
             '{"type":$type,"current_version":$cur,"new_version":$new,"release_url":$url,"timestamp":$ts}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build generic payload for self-update notify"
         }
@@ -256,7 +290,10 @@ _self_update_apply() {
         log "Error: malformed SHA256 file (got: '${expected_hash}')"
         _suu_cleanup; return 1
     }
-    actual_hash=$(sha256sum "$tmp_script" | awk '{print $1}')
+    actual_hash=$(_sha256 "$tmp_script") || {
+        log "Error: cannot compute SHA256 (no sha256sum or shasum available)"
+        _suu_cleanup; return 1
+    }
     if [[ $expected_hash != "$actual_hash" ]]; then
         log "Error: SHA256 mismatch — aborting update (expected: ${expected_hash}, got: ${actual_hash})"
         _suu_cleanup; return 1
@@ -402,7 +439,7 @@ send_discord_notification() {
         --arg title "$description" \
         --argjson color "$color" \
         --argjson fields "$fields" \
-        --arg ts "$(date -u +'%FT%T.%3NZ')" \
+        --arg ts "$(_iso_ts)" \
         '{"embeds":[{"title":$title,"color":$color,"fields":$fields,
             "footer":{"text":"Powered by Hoist"},"timestamp":$ts}],
           "username":"Hoist"}')
@@ -419,7 +456,7 @@ send_generic_webhook() {
         --arg image "$5" \
         --arg old_revision "$7" --arg new_revision "$8" \
         --arg old_image_id "$9" --arg new_image_id "${10}" \
-        --arg ts "$(date -u +'%FT%T.%3NZ')" \
+        --arg ts "$(_iso_ts)" \
         '{"type":$type,"container":$container,"image":$image,
           "old_image_id":$old_image_id,"new_image_id":$new_image_id,
           "old_version":$old_version,"new_version":$new_version,
