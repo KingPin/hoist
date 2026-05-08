@@ -56,6 +56,15 @@ bash hoist.sh [options]
 | `--tag <value>` | Use a label subset (e.g. `--tag nightly` reads `com.sumguy.hoist.nightly.*` labels) |
 | `--dry-run` | Show what would be updated without pulling, recreating, or notifying |
 | `--parallel <N>` | Process containers concurrently with `N` workers |
+| `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
+
+After every run, hoist prints a one-line summary:
+
+```
+[HH:MM:SS] Run complete: 3 updated (1 failed), 2 notified, 5 no-change, 12 skipped
+```
+
+In `--dry-run` mode this becomes `Run complete (dry-run): N would update, N would notify, ...`.
 
 ## Labels
 
