@@ -77,7 +77,7 @@ trap 'rm -rf "$tmp"' EXIT INT TERM HUP
 # distinguish HTTP 404 (asset genuinely missing) from network/proxy/DNS errors.
 _fetch() {
     local asset="$1" optional="${2:-false}" http
-    http=$(curl -sS --max-time 60 --connect-timeout 10 \
+    http=$(curl -sSL --max-time 60 --connect-timeout 10 \
         -H "User-Agent: hoist-installer" \
         -w '%{http_code}' \
         -o "${tmp}/${asset}" "${url_prefix}/${asset}" 2>/dev/null) || http="000"
