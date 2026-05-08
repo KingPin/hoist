@@ -3,7 +3,7 @@ if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
     echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown}). On macOS: brew install bash" >&2
     exit 1
 fi
-HOIST_VERSION="1.1.0"
+HOIST_VERSION="1.2.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
