@@ -48,6 +48,32 @@ while [[ "$1" != "" ]]; do
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
     --list|--status) DO_LIST=true ;;
+    -h|--help|-\?)
+        cat <<EOF
+hoist v${HOIST_VERSION} — auto-update or notify on Docker containers via labels
+
+Usage: hoist [options]
+
+Options:
+  --tag <value>      Use a label subset (e.g. --tag nightly reads
+                     com.sumguy.hoist.nightly.* labels)
+  --dry-run          Show what would be pulled/updated without making
+                     changes or sending notifications (implies --verbose)
+  --verbose          Log skipped containers (no hoist labels)
+  --parallel <N>     Process containers concurrently with N workers
+  --list, --status   Print a table of running containers and their label
+                     config, then exit (no pulls or updates)
+  --update           Self-update hoist to the latest GitHub release
+  --force            With --update, reinstall even if already up to date
+  --version          Print version and exit
+  -h, --help, -?     Show this help and exit
+
+Config file (sourced before CLI flag parsing):
+  \$HOIST_CONFIG, ./hoist.conf, or /etc/hoist/hoist.conf
+
+Repo: https://github.com/${HOIST_REPO}
+EOF
+        exit 0 ;;
     esac
     shift
 done
