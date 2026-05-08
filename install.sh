@@ -41,9 +41,9 @@ _sudo_if_needed() {
         probe="$(dirname "$probe")"
     done
     if [[ -w "$probe" ]]; then
-        "$@"
+        "$@" || err "step failed (target: $target): $*"
     elif command -v sudo >/dev/null 2>&1; then
-        sudo "$@"
+        sudo "$@" || err "privileged step failed or was cancelled (target: $target): $*"
     else
         err "cannot write to $target and sudo is not available"
     fi
@@ -69,9 +69,10 @@ else
     info "Installing hoist (latest release)"
 fi
 
-# Tempdir
-tmp=$(mktemp -d -t hoist.XXXXXX 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/hoist.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d -t hoist.XXXXXX 2>/dev/null) \
+    || tmp=$(mktemp -d "${TMPDIR:-/tmp}/hoist.XXXXXX") \
+    || err "failed to create temp directory"
+trap 'rm -rf "$tmp"' EXIT INT TERM HUP
 
 # hoist.sh is required; hoist.conf.example is best-effort so the installer still
 # works against releases that predate the conf.example asset. We use -w to
