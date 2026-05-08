@@ -18,6 +18,7 @@ CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 UPDATE_CHECK="${UPDATE_CHECK:-notify}"
 DO_SELF_UPDATE=false
 FORCE=false
+DO_LIST=false
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -46,6 +47,7 @@ while [[ "$1" != "" ]]; do
     --update)     DO_SELF_UPDATE=true ;;
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
+    --list|--status) DO_LIST=true ;;
     esac
     shift
 done
@@ -628,6 +630,55 @@ print_summary() {
     log "$msg"
 }
 
+list_containers() {
+    printf '%-20s %-32s %-7s %-7s %s\n' "CONTAINER" "IMAGE" "UPDATE" "NOTIFY" "CACHED DIGEST"
+    local container_name
+    for container_name in "${containers[@]}"; do
+        local inspect
+        inspect=$("${DOCKER_BINARY}" inspect "$container_name" 2>/dev/null) || {
+            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(inspect failed)" "-" "-" "-"
+            continue
+        }
+
+        local _jq_out
+        _jq_out=$(jq -r --arg tag "$TAG" '
+            .[0] |
+            .Config.Image,
+            (.Config.Labels["com.sumguy.hoist\($tag).update"] // .Config.Labels["org.hotio.pullio\($tag).update"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // "")
+        ' <<< "$inspect") || {
+            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(parse failed)" "-" "-" "-"
+            continue
+        }
+        readarray -t _lv <<< "$_jq_out"
+
+        local image="${_lv[0]}" update_label="${_lv[1]}" notify_label="${_lv[2]}"
+        local update_col notify_col cached_col
+
+        if [[ -z $update_label && -z $notify_label ]]; then
+            update_col="-"
+            notify_col="-"
+        else
+            [[ $update_label == true ]] && update_col="yes" || update_col="no"
+            [[ $notify_label == true ]] && notify_col="yes" || notify_col="no"
+        fi
+
+        local safe_name
+        safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
+        local raw_digest
+        raw_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
+        if [[ -n $raw_digest ]]; then
+            local stripped="${raw_digest#sha256:}"
+            cached_col="${stripped:0:13}"
+        else
+            cached_col="-"
+        fi
+
+        printf '%-20s %-32s %-7s %-7s %s\n' \
+            "$container_name" "$image" "$update_col" "$notify_col" "$cached_col"
+    done
+}
+
 trap 'exit 130' INT
 
 if [[ $DO_SELF_UPDATE == true ]]; then
@@ -640,6 +691,12 @@ fi
 
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
+
+if [[ $DO_LIST == true ]]; then
+    list_containers
+    exit 0
+fi
+
 rm -f "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null || true
 setup_environment
 check_maintenance_window
