@@ -14,8 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate SHA256 checksum
-        run: sha256sum hoist.sh > hoist.sh.sha256
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum hoist.sh > hoist.sh.sha256
+          sha256sum hoist.conf.example > hoist.conf.example.sha256
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -23,6 +25,8 @@ jobs:
           files: |
             hoist.sh
             hoist.sh.sha256
+            hoist.conf.example
+            hoist.conf.example.sha256
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
