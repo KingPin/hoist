@@ -31,10 +31,16 @@ _sha256() {
     fi
 }
 
-# Run command with sudo iff the target path isn't writable by the current user.
+# Run command with sudo iff the nearest existing ancestor of target isn't writable.
+# Walking up handles deeply nested missing paths (e.g. INSTALL_DIR=$HOME/.local/bin
+# when $HOME/.local doesn't exist yet — mkdir -p would succeed without sudo).
 _sudo_if_needed() {
     local target="$1"; shift
-    if [[ -w "$target" ]] || { [[ ! -e "$target" ]] && [[ -w "$(dirname "$target")" ]]; }; then
+    local probe="$target"
+    while [[ ! -e "$probe" && "$probe" != "/" ]]; do
+        probe="$(dirname "$probe")"
+    done
+    if [[ -w "$probe" ]]; then
         "$@"
     elif command -v sudo >/dev/null 2>&1; then
         sudo "$@"
