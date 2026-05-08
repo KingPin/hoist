@@ -180,13 +180,15 @@ _sha256() {
 }
 
 _iso_ts() {
-    # GNU date supports %3N (ms); BSD date doesn't. Fall back to second precision.
+    # %3N is GNU-only; BSD date drops or echoes the literal token, varying by libc.
+    # Validate the result against a strict ISO-8601 millisecond pattern; otherwise
+    # downgrade to second precision so webhook payloads stay parseable.
     local ts
     ts=$(date -u +'%FT%T.%3NZ' 2>/dev/null)
-    if [[ $ts == *3N* || -z $ts ]]; then
-        date -u +'%FT%TZ'
-    else
+    if [[ $ts =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$ ]]; then
         printf '%s' "$ts"
+    else
+        date -u +'%FT%TZ'
     fi
 }
 
