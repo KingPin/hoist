@@ -191,11 +191,27 @@ Updates require write access to the running script path. The downloaded asset is
 
 ## Running on a schedule
 
-Example cron entry to check for updates every day at 4 AM:
+Hoist can install its own scheduled run on Linux:
 
-```cron
-0 4 * * * hoist --parallel 4 >> /var/log/hoist.log 2>&1
+```bash
+hoist --cron install                     # interactive: prompts for schedule, user, backend
+hoist --cron install --schedule hourly --user root --backend cron   # non-interactive
+hoist --cron status                      # show what's currently installed
+hoist --cron print                       # preview the file(s) that would be written
+hoist --cron remove                      # uninstall the hoist-managed schedule
+hoist --cron                             # interactive menu
 ```
+
+`--cron install` auto-detects systemd vs. cron and writes either `/etc/cron.d/hoist`
+or a `hoist.service` + `hoist.timer` pair in `/etc/systemd/system/`. Files carry a
+`# Managed by hoist --cron install` marker; hoist refuses to overwrite a file at
+the same path that lacks it.
+
+Schedule presets: `30min`, `hourly`, `6hourly`, `daily` (03:00), `weekly` (Sun 03:00),
+or pass any cron expression / systemd `OnCalendar` value.
+
+On macOS, hoist points you at a launchd plist example. See
+[`docs/scheduling.md`](docs/scheduling.md) for the full reference (cron, systemd, launchd).
 
 ## Notifications
 
