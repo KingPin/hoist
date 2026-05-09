@@ -36,6 +36,8 @@ CRON_ACTION=""
 CRON_SCHEDULE_FLAG=""
 CRON_USER_FLAG=""
 CRON_BACKEND_FLAG=""
+ONLY_LIST=""
+EXCLUDE_LIST=""
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -65,6 +67,10 @@ while [[ "$1" != "" ]]; do
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
     --list|--status) DO_LIST=true ;;
+    --only=*)     ONLY_LIST="${1#*=}" ;;
+    --only)       shift; [[ -n "$1" && "$1" != "--"* ]] && ONLY_LIST="$1" ;;
+    --exclude=*)  EXCLUDE_LIST="${1#*=}" ;;
+    --exclude)    shift; [[ -n "$1" && "$1" != "--"* ]] && EXCLUDE_LIST="$1" ;;
     --cron=*)
         echo "Error: --cron does not take a value with '='; use: hoist --cron <action>" >&2
         exit 2 ;;
@@ -101,6 +107,8 @@ Options:
   --parallel <N>     Process containers concurrently with N workers
   --list, --status   Print a table of running containers and their label
                      config, then exit (no pulls or updates)
+  --only <names>     Comma-separated container names to include (others skipped)
+  --exclude <names>  Comma-separated container names to exclude
   --update           Self-update hoist to the latest GitHub release
   --force            With --update, reinstall even if already up to date
   --version          Print version and exit
@@ -228,6 +236,60 @@ _semver_gt() {
         [[ $av -lt $bv ]] && return 1
     done
     return 1
+}
+
+# 0 if a == b, ignoring pre-release suffixes
+_semver_eq() {
+    local IFS=.
+    local -a a=($1) b=($2)
+    for i in 0 1 2; do
+        local av=${a[i]:-0} bv=${b[i]:-0}
+        av=${av%%[!0-9]*}; bv=${bv%%[!0-9]*}
+        [[ $av != "$bv" ]] && return 1
+    done
+    return 0
+}
+
+# _semver_satisfies <constraint> <version>  -> 0 if version satisfies constraint
+# Supports: ^X.Y.Z (same major), ~X.Y.Z (same major+minor), >=X, <=X, >X, <X, =X, X (exact)
+_semver_satisfies() {
+    local constraint="$1" version="$2"
+    [[ -z $version ]] && return 0   # no version label = can't enforce, fail-open
+    local op base
+    case "$constraint" in
+        ^*)  op="^"; base="${constraint#^}" ;;
+        ~*)  op="~"; base="${constraint#~}" ;;
+        ">="*) op=">="; base="${constraint#>=}" ;;
+        "<="*) op="<="; base="${constraint#<=}" ;;
+        ">"*)  op=">";  base="${constraint#>}" ;;
+        "<"*)  op="<";  base="${constraint#<}" ;;
+        "="*)  op="=";  base="${constraint#=}" ;;
+        *)     op="=";  base="$constraint" ;;
+    esac
+    local IFS=.
+    local -a c=($base) v=($version)
+    case "$op" in
+        ^)  [[ ${v[0]:-0} == "${c[0]:-0}" ]] || return 1
+            _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        ~)  [[ ${v[0]:-0} == "${c[0]:-0}" && ${v[1]:-0} == "${c[1]:-0}" ]] || return 1
+            _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        ">=") _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        "<=") ! _semver_gt "$version" "$base" ;;
+        ">")  _semver_gt "$version" "$base" ;;
+        "<")  _semver_gt "$base" "$version" ;;
+        "=")  _semver_eq "$version" "$base" ;;
+    esac
+}
+
+# _check_pause_until <iso_str>  -> 0 if past the pause time (proceed), 1 if still paused
+_check_pause_until() {
+    local target now
+    target=$(date -d "$1" +%s 2>/dev/null) || {
+        log "Warning: pause_until value '$1' is not parseable; ignoring"
+        return 0
+    }
+    now=$(date +%s)
+    (( now >= target ))
 }
 
 _sha256() {
@@ -1247,6 +1309,7 @@ process_container() {
     local hoist_telegram_bot_token hoist_telegram_chat_id
     local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
     local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
+    local hoist_pause_until hoist_constraint hoist_group
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
@@ -1276,7 +1339,10 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).teams.webhook"]      // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).matrix.homeserver"]  // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).matrix.room_id"]     // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).matrix.token"]       // "")
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.token"]       // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).pause_until"]        // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).constraint"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).group"]              // "")
     ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
     readarray -t _vals <<< "$_jq_out"
 
@@ -1304,6 +1370,9 @@ process_container() {
     hoist_matrix_homeserver="${_vals[21]}"
     hoist_matrix_room_id="${_vals[22]}"
     hoist_matrix_token="${_vals[23]}"
+    hoist_pause_until="${_vals[24]}"
+    hoist_constraint="${_vals[25]}"
+    hoist_group="${_vals[26]}"
 
     local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
     local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
@@ -1331,6 +1400,12 @@ process_container() {
     fi
 
     if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
+        if [[ -n $hoist_pause_until ]] && ! _check_pause_until "$hoist_pause_until"; then
+            log "$container_name: paused until $hoist_pause_until"
+            _tokens+=("paused")
+            printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+            return 0
+        fi
         if [[ -n "$hoist_registry_authfile" ]]; then
             if [[ "$hoist_registry_authfile" != /* ]]; then
                 log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
@@ -1356,6 +1431,11 @@ process_container() {
             log "$container_name: Pulling image..."
             compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
                 log "$container_name: Pull failed"
+                if [[ -n $hoist_group ]]; then
+                    local _g_safe
+                    _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+                    : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
+                fi
                 return 1
             }
 
@@ -1375,7 +1455,29 @@ process_container() {
 
         local status="🔄 Update available" status_generic="update_available" color=768753
 
-        if [[ $image_digest != "$container_image_digest" && $hoist_update == true ]]; then
+        # Constraint check: if violated, block update but still allow notify
+        local _constraint_blocked=false
+        if [[ -n $hoist_constraint && -n $new_oci_version ]] \
+           && ! _semver_satisfies "$hoist_constraint" "$new_oci_version"; then
+            log "$container_name: constraint '$hoist_constraint' violated by version '$new_oci_version' — blocking update"
+            _constraint_blocked=true
+            _tokens+=("constraint_blocked")
+        fi
+
+        # Group abort: if any peer in the same group already failed to pull, skip update
+        local _group_aborted=false
+        if [[ -n $hoist_group ]]; then
+            local _g_safe
+            _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+            if [[ -f "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" ]]; then
+                log "$container_name: group '$hoist_group' has a failed peer — aborting update"
+                _group_aborted=true
+                _tokens+=("group_aborted")
+            fi
+        fi
+
+        if [[ $image_digest != "$container_image_digest" && $hoist_update == true \
+              && $_constraint_blocked != true && $_group_aborted != true ]]; then
             if [[ $DRY_RUN == true ]]; then
                 log "$container_name: [dry-run] would update container"
             else
@@ -1489,18 +1591,22 @@ process_container() {
 print_summary() {
     local updated=0 update_failed=0 notified=0 no_change=0 skipped=0
     local would_update=0 would_notify=0
+    local paused=0 constraint_blocked=0 group_aborted=0
     local f token
     for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
         [[ -f $f ]] || continue
         while IFS= read -r token; do
             case "$token" in
-                updated)       (( updated++ )) ;;
-                update_failed) (( update_failed++ )) ;;
-                notified)      (( notified++ )) ;;
-                no_change)     (( no_change++ )) ;;
-                skipped)       (( skipped++ )) ;;
-                would_update)  (( would_update++ )) ;;
-                would_notify)  (( would_notify++ )) ;;
+                updated)            (( updated++ )) ;;
+                update_failed)      (( update_failed++ )) ;;
+                notified)           (( notified++ )) ;;
+                no_change)          (( no_change++ )) ;;
+                skipped)            (( skipped++ )) ;;
+                would_update)       (( would_update++ )) ;;
+                would_notify)       (( would_notify++ )) ;;
+                paused)             (( paused++ )) ;;
+                constraint_blocked) (( constraint_blocked++ )) ;;
+                group_aborted)      (( group_aborted++ )) ;;
             esac
         done < "$f"
     done
@@ -1513,16 +1619,19 @@ print_summary() {
         [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
         msg="Run complete: ${updated_part}, ${notified} notified, ${no_change} no-change, ${skipped} skipped"
     fi
+    [[ $paused -gt 0 ]]             && msg+=", ${paused} paused"
+    [[ $constraint_blocked -gt 0 ]] && msg+=", ${constraint_blocked} constraint-blocked"
+    [[ $group_aborted -gt 0 ]]      && msg+=", ${group_aborted} group-aborted"
     log "$msg"
 }
 
 list_containers() {
-    printf '%-20s %-32s %-7s %-7s %s\n' "CONTAINER" "IMAGE" "UPDATE" "NOTIFY" "CACHED DIGEST"
+    printf '%-20s %-32s %-7s %-7s %-18s %s\n' "CONTAINER" "IMAGE" "UPDATE" "NOTIFY" "POLICY" "CACHED DIGEST"
     local container_name
     for container_name in "${containers[@]}"; do
         local inspect
         inspect=$("${DOCKER_BINARY}" inspect "$container_name" 2>/dev/null) || {
-            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(inspect failed)" "-" "-" "-"
+            printf '%-20s %-32s %-7s %-7s %-18s %s\n' "$container_name" "(inspect failed)" "-" "-" "-" "-"
             continue
         }
 
@@ -1531,15 +1640,19 @@ list_containers() {
             .[0] |
             .Config.Image,
             (.Config.Labels["com.sumguy.hoist\($tag).update"] // .Config.Labels["org.hotio.pullio\($tag).update"] // ""),
-            (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // "")
+            (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).pause_until"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).constraint"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).group"] // "")
         ' <<< "$inspect") || {
-            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(parse failed)" "-" "-" "-"
+            printf '%-20s %-32s %-7s %-7s %-18s %s\n' "$container_name" "(parse failed)" "-" "-" "-" "-"
             continue
         }
         readarray -t _lv <<< "$_jq_out"
 
         local image="${_lv[0]}" update_label="${_lv[1]}" notify_label="${_lv[2]}"
-        local update_col notify_col cached_col
+        local pause_label="${_lv[3]}" constraint_label="${_lv[4]}" group_label="${_lv[5]}"
+        local update_col notify_col policy_col cached_col
 
         if [[ -z $update_label && -z $notify_label ]]; then
             update_col="-"
@@ -1547,6 +1660,16 @@ list_containers() {
         else
             [[ $update_label == true ]] && update_col="yes" || update_col="no"
             [[ $notify_label == true ]] && notify_col="yes" || notify_col="no"
+        fi
+
+        local _policy_parts=()
+        [[ -n $pause_label ]]      && _policy_parts+=("paused:${pause_label}")
+        [[ -n $constraint_label ]] && _policy_parts+=("pin:${constraint_label}")
+        [[ -n $group_label ]]      && _policy_parts+=("group:${group_label}")
+        if [[ ${#_policy_parts[@]} -eq 0 ]]; then
+            policy_col="-"
+        else
+            policy_col=$(IFS=,; printf '%s' "${_policy_parts[*]}")
         fi
 
         local safe_name
@@ -1560,8 +1683,8 @@ list_containers() {
             cached_col="-"
         fi
 
-        printf '%-20s %-32s %-7s %-7s %s\n' \
-            "$container_name" "$image" "$update_col" "$notify_col" "$cached_col"
+        printf '%-20s %-32s %-7s %-7s %-18s %s\n' \
+            "$container_name" "$image" "$update_col" "$notify_col" "$policy_col" "$cached_col"
     done
 }
 
@@ -1580,12 +1703,37 @@ fi
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
 
+# Apply --only / --exclude filters
+if [[ -n "$ONLY_LIST" || -n "$EXCLUDE_LIST" ]]; then
+    declare -A _only_set _exclude_set
+    if [[ -n "$ONLY_LIST" ]]; then
+        IFS=',' read -ra _only_arr <<< "$ONLY_LIST"
+        for n in "${_only_arr[@]}"; do n="${n## }"; n="${n%% }"; [[ -n "$n" ]] && _only_set[$n]=1; done
+    fi
+    if [[ -n "$EXCLUDE_LIST" ]]; then
+        IFS=',' read -ra _excl_arr <<< "$EXCLUDE_LIST"
+        for n in "${_excl_arr[@]}"; do n="${n## }"; n="${n%% }"; [[ -n "$n" ]] && _exclude_set[$n]=1; done
+    fi
+    declare -a _filtered=()
+    declare -A _seen_names=()
+    for c in "${containers[@]}"; do
+        _seen_names[$c]=1
+        if [[ -n "$ONLY_LIST" && -z "${_only_set[$c]+x}" ]]; then continue; fi
+        if [[ -n "${_exclude_set[$c]+x}" ]]; then continue; fi
+        _filtered+=("$c")
+    done
+    # Warn on unknown names in filter lists
+    for n in "${!_only_set[@]}";    do [[ -z "${_seen_names[$n]+x}" ]] && log "Warning: --only name '$n' not found among running containers"; done
+    for n in "${!_exclude_set[@]}"; do [[ -z "${_seen_names[$n]+x}" ]] && log "Warning: --exclude name '$n' not found among running containers"; done
+    containers=("${_filtered[@]}")
+fi
+
 if [[ $DO_LIST == true ]]; then
     list_containers
     exit 0
 fi
 
-rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup 2>/dev/null || true
+rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
 setup_environment
 check_maintenance_window
 _hc_ping start

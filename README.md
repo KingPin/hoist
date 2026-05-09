@@ -95,6 +95,8 @@ bash hoist.sh [options]
 | `--dry-run` | Show what would be updated without pulling, recreating, or notifying (implies `--verbose`) |
 | `--verbose` | Log containers skipped because they have no hoist labels |
 | `--parallel <N>` | Process containers concurrently with `N` workers |
+| `--only <names>` | Comma-separated list of container names to include (others ignored). Names not currently running emit a warning. |
+| `--exclude <names>` | Comma-separated list of container names to skip. Highest precedence — wins over `--only`. |
 | `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
 | `--update` | Self-update hoist to the latest GitHub release (interactive — prompts before replacing) |
 | `--force` | With `--update`, skip the confirmation prompt and reinstall even if already up to date |
@@ -135,6 +137,9 @@ services:
       com.sumguy.hoist.script.update: "/opt/scripts/pre-update.sh"
       com.sumguy.hoist.script.notify: "/opt/scripts/on-notify.sh"
       com.sumguy.hoist.registry.authfile: "/run/secrets/registry.json"
+      com.sumguy.hoist.pause_until: "2026-06-01"          # skip until this date/datetime
+      com.sumguy.hoist.constraint: "^1.2"                 # semver pin (^, ~, >=, <=, >, <, =)
+      com.sumguy.hoist.group: "db"                        # any group member's pull failure aborts the rest
 ```
 
 `update` and `notify` can both be set on the same container — it will update and then notify.
@@ -159,6 +164,18 @@ The `registry.authfile` label points to a JSON file:
   "password": "mytoken"
 }
 ```
+
+### Policy labels
+
+Three labels gate whether an update is applied (notifications still fire so you know what was held back):
+
+- **`pause_until`** — ISO date (`2026-06-01`) or datetime (`2026-06-01T15:00:00Z`). Hoist skips the container entirely until current time ≥ value. Emits the `paused` summary token. Unparseable values fail open with a warning, so a typo never silently pauses forever.
+- **`constraint`** — semver-style pin against the new image's `org.opencontainers.image.version` label. Supported operators: `^1.2`, `~1.2.3`, `>=1.0`, `<=2.0`, `>1.0`, `<2.0`, `=1.2.3`, or an exact `1.2.3`. If the candidate version violates, hoist skips the update, still notifies, and emits `constraint_blocked`. Images without an OCI version label fail open (cannot enforce).
+- **`group`** — free-form group name. If any container in the group has a pull failure, the others' updates are aborted (`group_aborted` token). Group atomicity is "soft" under `--parallel N`: a sibling may finish updating before its peer fails — accepted limitation. Group flags reset at the start of each run.
+
+### Container filters
+
+`--only foo,bar` and `--exclude baz,qux` filter which running containers hoist processes. `--exclude` wins over `--only`. Names that aren't currently running emit a warning but don't fail the run. Filters apply before label inspection — useful for ad-hoc maintenance without editing labels.
 
 ## Custom scripts
 

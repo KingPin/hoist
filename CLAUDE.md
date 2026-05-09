@@ -56,6 +56,9 @@ All behavior is controlled by Docker labels on containers:
 | `com.sumguy.hoist[.TAG].script.update` | Shell command run before container recreate |
 | `com.sumguy.hoist[.TAG].script.notify` | Shell command run before webhook notification |
 | `com.sumguy.hoist[.TAG].registry.authfile` | JSON file with `username`, `password`, `registry` |
+| `com.sumguy.hoist[.TAG].pause_until` | ISO date/datetime; skip container until current time ≥ value (token: `paused`). Unparseable = fail-open with warning |
+| `com.sumguy.hoist[.TAG].constraint` | Semver pin (`^`, `~`, `>=`, `<=`, `>`, `<`, `=`, exact) checked against new image's `org.opencontainers.image.version`. Violation = skip update + notify (token: `constraint_blocked`). Missing version label = fail-open |
+| `com.sumguy.hoist[.TAG].group` | Free-form group name. Any member's pull failure writes `${CACHE_LOCATION}/hoist-group-<group>.failed` and aborts updates for the rest (token: `group_aborted`). Soft atomicity under `--parallel`: a sibling may finish before its peer fails |
 
 A container can have both `update` and `notify` set — it will update AND send notifications.
 
@@ -65,7 +68,7 @@ Notification state is persisted in `${CACHE_LOCATION}/hoist-<safe-name>.notified
 
 ### Run summary
 
-Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files are wiped at the start of each run.
+Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`, `paused`, `constraint_blocked`, `group_aborted`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files (and `hoist-group-*.failed` flags) are wiped at the start of each run.
 
 ### Self-update
 

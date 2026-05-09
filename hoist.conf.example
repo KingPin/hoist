@@ -59,6 +59,16 @@
 # WEBHOOK_ROLLUP=true
 # WEBHOOK_ROLLUP_CHANNELS=discord,slack,generic,telegram,gotify,ntfy,teams,matrix
 
+# Policy labels (set per container, not in this config):
+#   com.sumguy.hoist.pause_until=YYYY-MM-DD or full ISO datetime — skip until reached
+#   com.sumguy.hoist.constraint=^1.2 / ~1.2.3 / >=1 / <2 / =1.2.3 — semver pin against
+#       new image's org.opencontainers.image.version label (notify still fires)
+#   com.sumguy.hoist.group=<name>      — any group member's pull failure aborts the rest
+#
+# Container filters (CLI-only, no config equivalent):
+#   --only foo,bar      include only these container names
+#   --exclude foo,bar   skip these container names (wins over --only)
+
 # Self-update behavior on every run: "notify", "update", or "off" (default: notify)
 #   notify — print to console + send to configured webhooks if a newer version exists
 #   update — automatically apply updates (no prompt); still fires configured webhooks before applying
