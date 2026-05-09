@@ -148,7 +148,8 @@ echo "  - Docs: https://github.com/${HOIST_REPO}#usage"
 
 if [[ -t 0 && -t 1 && "${HOIST_NONINTERACTIVE:-0}" != 1 ]]; then
     echo
-    read -rp "Install a scheduled run for hoist now? [y/N] " _setup_ans
+    _setup_ans=""
+    read -rp "Install a scheduled run for hoist now? [y/N] " _setup_ans || true
     if [[ ${_setup_ans,,} == y ]]; then
         exec "${INSTALL_DIR}/hoist" --cron install
     fi

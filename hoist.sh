@@ -62,12 +62,18 @@ while [[ "$1" != "" ]]; do
             CRON_ACTION="$2"
             shift
         fi ;;
-    --schedule=*) CRON_SCHEDULE_FLAG="${1#*=}" ;;
-    --schedule)   shift; [[ -n "${1:-}" && "$1" != --* ]] && CRON_SCHEDULE_FLAG="$1" ;;
-    --user=*)     CRON_USER_FLAG="${1#*=}" ;;
-    --user)       shift; [[ -n "${1:-}" && "$1" != --* ]] && CRON_USER_FLAG="$1" ;;
-    --backend=*)  CRON_BACKEND_FLAG="${1#*=}" ;;
-    --backend)    shift; [[ -n "${1:-}" && "$1" != --* ]] && CRON_BACKEND_FLAG="$1" ;;
+    --schedule=*) CRON_SCHEDULE_FLAG="${1#*=}"
+                  [[ -n $CRON_SCHEDULE_FLAG ]] || { echo "Error: --schedule requires a value" >&2; exit 2; } ;;
+    --schedule)   [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --schedule requires a value" >&2; exit 2; }
+                  CRON_SCHEDULE_FLAG="$2"; shift ;;
+    --user=*)     CRON_USER_FLAG="${1#*=}"
+                  [[ -n $CRON_USER_FLAG ]] || { echo "Error: --user requires a value" >&2; exit 2; } ;;
+    --user)       [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --user requires a value" >&2; exit 2; }
+                  CRON_USER_FLAG="$2"; shift ;;
+    --backend=*)  CRON_BACKEND_FLAG="${1#*=}"
+                  [[ -n $CRON_BACKEND_FLAG ]] || { echo "Error: --backend requires a value" >&2; exit 2; } ;;
+    --backend)    [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --backend requires a value" >&2; exit 2; }
+                  CRON_BACKEND_FLAG="$2"; shift ;;
     -h|--help|-\?)
         cat <<EOF
 hoist v${HOIST_VERSION} — auto-update or notify on Docker containers via labels
@@ -486,7 +492,10 @@ _detect_scheduler() {
     if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
         has_systemd=true
     fi
-    if [[ -d /etc/cron.d ]]; then
+    if [[ -d /etc/cron.d ]] \
+       || command -v crond >/dev/null 2>&1 \
+       || command -v cron  >/dev/null 2>&1 \
+       || [[ -d /etc/crontabs ]]; then
         has_cron=true
     fi
     if   [[ $has_systemd == true && $has_cron == true ]]; then echo "both"
@@ -580,13 +589,27 @@ _cron_backend_install() {
         return 0
     fi
 
+    local cron_dir; cron_dir=$(dirname "$_CRON_PATH_D")
+    if [[ ! -d $cron_dir ]]; then
+        _sudo_if_needed "$cron_dir" mkdir -p "$cron_dir" \
+            || { log "Error: cannot create $cron_dir"; return 1; }
+    fi
+
     local tmp
     tmp=$(mktemp /tmp/hoist-cron.XXXXXX) || { log "Error: cannot create temp file"; return 1; }
     printf '%s\n' "$content" > "$tmp"
     _sudo_if_needed "$_CRON_PATH_D" install -m 0644 "$tmp" "$_CRON_PATH_D" \
         || { rm -f "$tmp"; log "Error: failed to install $_CRON_PATH_D"; return 1; }
     rm -f "$tmp"
-    _sudo_if_needed "$_CRON_LOG_FILE" touch "$_CRON_LOG_FILE" || true
+
+    if _sudo_if_needed "$_CRON_LOG_FILE" touch "$_CRON_LOG_FILE" 2>/dev/null; then
+        if [[ $run_user != root ]]; then
+            _sudo_if_needed "$_CRON_LOG_FILE" chown "$run_user" "$_CRON_LOG_FILE" 2>/dev/null \
+                || log "Warning: could not chown $_CRON_LOG_FILE to $run_user — schedule will fail to write logs"
+        fi
+    else
+        log "Warning: could not create $_CRON_LOG_FILE — cron will fail to redirect output"
+    fi
     log "Installed $_CRON_PATH_D (schedule: $schedule_expr, user: $run_user)"
     log "Logs: $_CRON_LOG_FILE"
 }
@@ -775,20 +798,27 @@ _prompt_schedule() {
     printf '%s' "$ans"
 }
 
+_validate_user() {
+    local user="$1"
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd "$user" >/dev/null 2>&1 \
+            || { echo "Error: user does not exist: $user" >&2; return 1; }
+    elif ! id "$user" >/dev/null 2>&1; then
+        echo "Error: user does not exist: $user" >&2; return 1
+    fi
+    if [[ $user != root ]] && ! id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        echo "Warning: user '$user' is not in the docker group — hoist will fail unless that's fixed" >&2
+    fi
+    return 0
+}
+
 _prompt_user() {
     local default="root"
     [[ -n ${SUDO_USER:-} ]] && default="$SUDO_USER"
     local ans
     read -rp "Run hoist as which user? [$default]: " ans >&2
     ans="${ans:-$default}"
-    if command -v getent >/dev/null 2>&1; then
-        getent passwd "$ans" >/dev/null 2>&1 || { echo "Error: user does not exist: $ans" >&2; return 1; }
-    elif ! id "$ans" >/dev/null 2>&1; then
-        echo "Error: user does not exist: $ans" >&2; return 1
-    fi
-    if [[ $ans != root ]] && ! id -nG "$ans" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-        echo "Warning: user '$ans' is not in the docker group — hoist will fail unless that's fixed" >&2
-    fi
+    _validate_user "$ans" || return 1
     printf '%s' "$ans"
 }
 
@@ -812,12 +842,26 @@ _cron_install_orchestrate() {
         if [[ $detected != both && $detected != "$backend" ]]; then
             log "Error: --backend $backend requested but only '$detected' is available"; return 1
         fi
-    else
-        backend=$(_prompt_backend "$detected") || return 1
     fi
 
+    # Fail fast on non-TTY when a prompt would be required.
+    local needs_prompt=false
+    [[ -z $schedule_input ]] && needs_prompt=true
+    [[ -z $run_user ]] && needs_prompt=true
+    [[ $detected == both && -z $backend ]] && needs_prompt=true
+    if [[ $needs_prompt == true && ! -t 0 ]]; then
+        log "Error: --cron install needs an interactive terminal for missing values."
+        log "  Pass --schedule, --user$([[ $detected == both ]] && printf %s ', --backend') to run non-interactively."
+        return 1
+    fi
+
+    [[ -n $backend ]]       || backend=$(_prompt_backend "$detected") || return 1
     [[ -n $schedule_input ]] || schedule_input=$(_prompt_schedule) || return 1
-    [[ -n $run_user ]]      || run_user=$(_prompt_user) || return 1
+    if [[ -n $run_user ]]; then
+        _validate_user "$run_user" || return 1
+    else
+        run_user=$(_prompt_user) || return 1
+    fi
 
     local schedule_expr
     schedule_expr=$(_cron_render_schedule "$backend" "$schedule_input") || return 1
@@ -826,7 +870,9 @@ _cron_install_orchestrate() {
     hoist_bin=$(_resolve_hoist_path) || return 1
 
     local fully_scripted=false
-    [[ -n ${CRON_SCHEDULE_FLAG:-} && -n ${CRON_USER_FLAG:-} && -n ${CRON_BACKEND_FLAG:-} ]] && fully_scripted=true
+    [[ -n ${CRON_SCHEDULE_FLAG:-} && -n ${CRON_USER_FLAG:-} ]] \
+        && { [[ $detected != both || -n ${CRON_BACKEND_FLAG:-} ]]; } \
+        && fully_scripted=true
 
     if [[ $DRY_RUN != true && $fully_scripted == false ]]; then
         log "About to install:"
@@ -863,7 +909,11 @@ _cron_remove_orchestrate() {
 _cron_print_orchestrate() {
     local backend="${CRON_BACKEND_FLAG:-}"
     local detected; detected=$(_detect_scheduler)
-    if [[ -z $backend ]]; then
+    if [[ -n $backend ]]; then
+        if [[ $backend != cron && $backend != systemd ]]; then
+            log "Error: --backend must be 'cron' or 'systemd' (got: $backend)"; return 1
+        fi
+    else
         case "$detected" in
             both|systemd) backend=systemd ;;
             cron|none)    backend=cron ;;
@@ -885,6 +935,8 @@ _cron_print_orchestrate() {
             echo
             echo "# === ${_CRON_SYSTEMD_TIMER} ==="
             _systemd_render_timer "$schedule_expr" ;;
+        *)
+            log "Error: unknown backend: $backend"; return 1 ;;
     esac
 }
 
