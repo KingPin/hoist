@@ -24,6 +24,7 @@ bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>] [--list] [--update]
 - `--parallel N` uses `xargs -P N` to process containers concurrently
 - `--list` / `--status` prints a table of running containers + their hoist labels and cached digest, then exits before any pulls
 - `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--version` prints `HOIST_VERSION` and exits
+- `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and `--user <name>` (and `--backend cron|systemd` if both are present on the host)
 
 ## Architecture
 
@@ -80,6 +81,27 @@ On every run (unless `UPDATE_CHECK=off`), `_self_update_check` queries the GitHu
 When `script.update` or `script.notify` runs, these `HOIST_*` env vars are set:
 
 `HOIST_CONTAINER`, `HOIST_IMAGE`, `HOIST_OLD_IMAGE_ID`, `HOIST_NEW_IMAGE_ID`, `HOIST_OLD_VERSION`, `HOIST_NEW_VERSION`, `HOIST_OLD_REVISION`, `HOIST_NEW_REVISION`, `HOIST_COMPOSE_SERVICE`, `HOIST_COMPOSE_WORKDIR`
+
+### Cron subcommand
+
+`--cron <action>` manages hoist's own scheduled run. Actions: `install`, `remove`, `print` (dry-print the unit/crontab to stdout), `status`. Bare `--cron` opens an interactive menu.
+
+Two backends, auto-detected by `_detect_scheduler` (`hoist.sh:486-506`):
+
+- **cron** — writes `/etc/cron.d/hoist` (a single file, with managed marker on line 1).
+- **systemd** — writes `/etc/systemd/system/hoist.service` + `hoist.timer`, then `daemon-reload` + `enable --now hoist.timer`.
+
+On hosts where only one is present, the backend is chosen for you. On hosts with both (`detected == both`), non-interactive runs require `--backend`.
+
+Non-interactive contract (`hoist.sh:850-857`): `install` needs `--schedule` (preset `30min|hourly|6hourly|daily|weekly` or a raw cron / `OnCalendar` expression) and `--user`. If any required value is missing and stdin isn't a TTY, hoist prints a clear error and exits — it never hangs waiting for input.
+
+Idempotency is marker-based: every managed file gets `# Managed by hoist --cron install` on line 1 (`_CRON_MARKER`, `hoist.sh:457`). `install` refuses to overwrite a file that doesn't carry the marker; `remove` refuses to delete one that doesn't. Re-running `install` is safe — it always rewrites the unit/cron file (and emits `Installed …`), so config-management tools should expect "changed" on every run rather than try to fake idempotence on top.
+
+Privilege handling lives in `_sudo_if_needed` (`hoist.sh:461-475`): walks up to the nearest existing ancestor of the target path and only escalates to `sudo` when that path isn't writable. Plays cleanly with Ansible `become` and the standalone `install.sh`.
+
+`systemd-analyze` is **only** required when validating a custom `OnCalendar` expression on the systemd backend (`hoist.sh:537-546`). Presets short-circuit validation. macOS targets aren't supported — `_launchd_doc` (`hoist.sh:755-764`) prints a pointer to `docs/scheduling.md` and returns 2.
+
+A worked Ansible playbook that drives `--cron install` through this contract lives in `examples/ansible/`.
 
 ### Parallel mode caveat
 
