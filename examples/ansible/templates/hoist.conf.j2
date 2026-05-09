@@ -1,0 +1,33 @@
+{{ ansible_managed | comment }}
+# Managed by Ansible — do not edit by hand.
+# Source: examples/ansible/templates/hoist.conf.j2 in the hoist repo.
+
+# Disable the per-run GitHub release check. Ansible owns the binary lifecycle;
+# letting hoist self-update would drift the host away from the playbook state.
+UPDATE_CHECK="off"
+
+# Notification dedupe state. /tmp (the upstream default) is ephemeral on tmpfs
+# systems, which causes duplicate notifications across reboots.
+CACHE_LOCATION="{{ hoist_cache_dir | default('/var/cache/hoist') }}"
+
+{% if hoist_log_file is defined %}
+LOG_FILE="{{ hoist_log_file }}"
+{% endif %}
+{% if hoist_parallel is defined %}
+PARALLEL={{ hoist_parallel }}
+{% endif %}
+{% if hoist_tag is defined %}
+TAG="{{ hoist_tag }}"
+{% endif %}
+{% if hoist_maintenance_window is defined %}
+MAINTENANCE_WINDOW="{{ hoist_maintenance_window }}"
+{% endif %}
+{% if hoist_global_discord_webhook is defined %}
+GLOBAL_DISCORD_WEBHOOK="{{ hoist_global_discord_webhook }}"
+{% endif %}
+{% if hoist_global_slack_webhook is defined %}
+GLOBAL_SLACK_WEBHOOK="{{ hoist_global_slack_webhook }}"
+{% endif %}
+{% if hoist_global_generic_webhook is defined %}
+GLOBAL_GENERIC_WEBHOOK="{{ hoist_global_generic_webhook }}"
+{% endif %}

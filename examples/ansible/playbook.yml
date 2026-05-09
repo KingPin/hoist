@@ -1,0 +1,127 @@
+---
+# Hoist deployment playbook.
+#
+# Installs hoist.sh from a GitHub release, drops a managed config under
+# /etc/hoist/, creates the cache directory, and (optionally) installs a
+# scheduled run via `hoist --cron install`.
+#
+# Usage:
+#   ansible-playbook -i inventory.example.ini playbook.yml --become
+#
+# Override variables on the command line or in your inventory:
+#   ansible-playbook ... -e hoist_version=v1.3.0 -e hoist_schedule=hourly
+#
+# See README.md in this directory for the full variable reference.
+
+- name: Deploy hoist
+  hosts: docker_hosts
+  become: true
+
+  vars:
+    # ---- Required-ish (have sensible defaults) ----
+    hoist_version: "latest"            # e.g. "v1.3.0" to pin; "latest" tracks the newest release
+    hoist_install_dir: "/usr/local/bin"
+    hoist_config_dir: "/etc/hoist"
+    hoist_cache_dir: "/var/cache/hoist"
+
+    # ---- Schedule ----
+    hoist_install_schedule: true       # set false to skip cron/systemd setup
+    hoist_schedule: "daily"            # preset (30min|hourly|6hourly|daily|weekly) or raw cron / OnCalendar
+    hoist_user: "root"                 # user the scheduled run executes as; must be in `docker` group if non-root
+    hoist_backend: "systemd"           # "systemd" or "cron". Required when both are installed on the host.
+
+    # ---- Optional config knobs (see templates/hoist.conf.j2) ----
+    # hoist_log_file: "/var/log/hoist.log"
+    # hoist_parallel: 4
+    # hoist_maintenance_window: "02:00-06:00"
+    # hoist_tag: "production"
+    # hoist_global_discord_webhook: "https://discord.com/api/webhooks/..."
+    # hoist_global_slack_webhook: "https://hooks.slack.com/services/..."
+    # hoist_global_generic_webhook: "https://example.com/webhook"
+
+    # ---- Release URL (rarely changed) ----
+    _hoist_release_base: "https://github.com/KingPin/hoist/releases"
+    _hoist_url: >-
+      {{ (_hoist_release_base ~ '/latest/download/hoist.sh')
+         if hoist_version == 'latest'
+         else (_hoist_release_base ~ '/download/' ~ hoist_version ~ '/hoist.sh') }}
+
+    # Optional: pin a SHA256 for the binary. Format: "sha256:<hex>".
+    # When unset, get_url skips checksum verification — fine for tracking
+    # latest, recommended to set when pinning a version. Grab the hash from:
+    #   https://github.com/KingPin/hoist/releases/download/<tag>/hoist.sh.sha256
+    # hoist_sha256: "sha256:<64-hex-chars>"
+
+  pre_tasks:
+    - name: Validate backend value
+      ansible.builtin.assert:
+        that:
+          - hoist_backend in ['systemd', 'cron']
+        fail_msg: "hoist_backend must be 'systemd' or 'cron' (got '{{ hoist_backend }}')"
+
+    - name: Ensure required runtime tools are installed
+      ansible.builtin.package:
+        name:
+          - jq
+          - curl
+        state: present
+
+  tasks:
+    - name: Install hoist binary from GitHub release
+      ansible.builtin.get_url:
+        url: "{{ _hoist_url }}"
+        dest: "{{ hoist_install_dir }}/hoist"
+        mode: "0755"
+        checksum: "{{ hoist_sha256 | default(omit) }}"
+        force: "{{ hoist_version == 'latest' }}"
+
+    - name: Ensure /etc/hoist exists
+      ansible.builtin.file:
+        path: "{{ hoist_config_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render /etc/hoist/hoist.conf
+      ansible.builtin.template:
+        src: hoist.conf.j2
+        dest: "{{ hoist_config_dir }}/hoist.conf"
+        mode: "0644"
+
+    - name: Ensure cache directory exists
+      ansible.builtin.file:
+        path: "{{ hoist_cache_dir }}"
+        state: directory
+        owner: "{{ hoist_user }}"
+        mode: "0755"
+
+    # `hoist --cron install` is safe to re-run (idempotent on disk via the
+    # `# Managed by hoist --cron install` marker), but it always rewrites the
+    # unit/cron file and emits "Installed ..." — Ansible will therefore mark
+    # this task `changed` on every run. That's accurate and harmless. See
+    # README.md for the rationale; we don't fake idempotence with a stat hack.
+    - name: Install scheduled run
+      ansible.builtin.command:
+        argv:
+          - "{{ hoist_install_dir }}/hoist"
+          - "--cron"
+          - "install"
+          - "--schedule"
+          - "{{ hoist_schedule }}"
+          - "--user"
+          - "{{ hoist_user }}"
+          - "--backend"
+          - "{{ hoist_backend }}"
+      register: hoist_cron
+      changed_when: "'Installed' in hoist_cron.stdout"
+      when: hoist_install_schedule | bool
+
+    - name: Verify scheduled run is healthy
+      ansible.builtin.command:
+        argv:
+          - "{{ hoist_install_dir }}/hoist"
+          - "--cron"
+          - "status"
+      register: hoist_cron_status
+      changed_when: false
+      failed_when: hoist_cron_status.rc != 0
+      when: hoist_install_schedule | bool
