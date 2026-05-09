@@ -536,11 +536,13 @@ _validate_cron_expr() {
 
 _validate_systemd_calendar() {
     local expr="$1"
-    if command -v systemd-analyze >/dev/null 2>&1; then
-        systemd-analyze calendar "$expr" >/dev/null 2>&1 \
-            || { echo "Error: invalid systemd OnCalendar expression: $expr" >&2; return 1; }
+    if ! command -v systemd-analyze >/dev/null 2>&1; then
+        echo "Error: systemd-analyze not available — cannot validate OnCalendar expression: $expr" >&2
+        echo "       Install the systemd package or use --backend cron." >&2
+        return 1
     fi
-    return 0
+    systemd-analyze calendar "$expr" >/dev/null 2>&1 \
+        || { echo "Error: invalid systemd OnCalendar expression: $expr" >&2; return 1; }
 }
 
 # Render preset OR custom expression for the chosen backend. Echoes result.
@@ -897,10 +899,10 @@ _cron_remove_orchestrate() {
 
     local removed_any=false
     if [[ -e $_CRON_PATH_D ]]; then
-        _cron_backend_remove && removed_any=true || return 1
+        if _cron_backend_remove; then removed_any=true; else return 1; fi
     fi
     if [[ -e $_CRON_SYSTEMD_TIMER || -e $_CRON_SYSTEMD_SERVICE ]]; then
-        _systemd_backend_remove && removed_any=true || return 1
+        if _systemd_backend_remove; then removed_any=true; else return 1; fi
     fi
     [[ $removed_any == true ]] || log "Nothing to remove."
     return 0
