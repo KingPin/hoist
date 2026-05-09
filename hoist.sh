@@ -117,15 +117,18 @@ EOF
     shift
 done
 
-# Bash 4+ check runs after arg parse so --version/--help still work on macOS
+# Bash 4.3+ check runs after arg parse so --version/--help still work on macOS
 # system bash 3.2 — users need a way to diagnose what they have installed.
-if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+# 4.3 is required for `wait -n` used by the parallel worker pool.
+if [[ -z ${BASH_VERSINFO+x} ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "Error: hoist requires bash 4.3+ (current: ${BASH_VERSION:-unknown})." >&2
     echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
     echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
     echo "  Verify with: bash --version" >&2
     exit 1
 fi
+
+trap 'kill 0 2>/dev/null; exit 130' INT TERM
 
 if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
@@ -141,15 +144,12 @@ done
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 
 setup_environment() {
+    # Exported so external child processes (user script.update / script.notify hooks,
+    # docker, curl) see them. Bash functions are inherited automatically by `&`-spawned
+    # subshells in the same process, so no `export -f` is needed for the parallel pool.
     export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE CURL_TIMEOUT
     export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
-    if [[ $PARALLEL -gt 1 ]]; then
-        export -f process_container compose_pull_wrapper compose_up_wrapper log
-        export -f send_discord_notification send_generic_webhook send_slack_notification
-        export -f check_maintenance_window validate_webhook_url validate_script_path
-        export -f _semver_gt _self_update_notify _self_update_apply _self_update_check _sha256 _iso_ts
-    fi
 }
 
 check_maintenance_window() {
@@ -1376,8 +1376,17 @@ check_maintenance_window
 
 log "Processing ${#containers[@]} containers (parallelism: $PARALLEL)"
 
-if [[ $PARALLEL -gt 1 ]]; then
-    printf '%s\n' "${containers[@]}" | xargs -P "$PARALLEL" -I {} bash -c 'process_container "$@"' _ {}
+if (( PARALLEL > 1 )); then
+    running=0
+    for container_name in "${containers[@]}"; do
+        if (( running >= PARALLEL )); then
+            wait -n
+            (( running-- ))
+        fi
+        process_container "$container_name" &
+        (( running++ ))
+    done
+    wait
 else
     for container_name in "${containers[@]}"; do
         process_container "$container_name"
