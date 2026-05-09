@@ -69,6 +69,18 @@
 #   --only foo,bar      include only these container names
 #   --exclude foo,bar   skip these container names (wins over --only)
 
+# Default timeout (seconds) for waiting on a container to become healthy after update,
+# when its label .healthcheck.wait=true is set. Per-container .healthcheck.timeout overrides.
+# HEALTHCHECK_TIMEOUT=120
+
+# Poll interval (seconds) while waiting for a container to report healthy/running.
+# HEALTHCHECK_INTERVAL=2
+
+# When true, rollback applies to every updated container automatically — equivalent to
+# setting com.sumguy.hoist.rollback=true on every label. Old image must still be on disk
+# (PRUNE_IMAGES=true after a successful run will remove the rollback target).
+# ROLLBACK_DEFAULT=false
+
 # Self-update behavior on every run: "notify", "update", or "off" (default: notify)
 #   notify — print to console + send to configured webhooks if a newer version exists
 #   update — automatically apply updates (no prompt); still fires configured webhooks before applying

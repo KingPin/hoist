@@ -35,6 +35,9 @@ CLI flags always override config file values.
 | `HEALTHCHECKS_PING_URL` | _(none)_ | Healthchecks.io heartbeat URL — pinged at start (`/start`), end (success), or `/fail` if any update failed |
 | `WEBHOOK_ROLLUP` | `false` | Send one summary webhook per run instead of per-container, for listed channels |
 | `WEBHOOK_ROLLUP_CHANNELS` | `discord,slack,generic` | Comma list of channels to roll up. Per-container labels are ignored for rolled-up channels. |
+| `HEALTHCHECK_TIMEOUT` | `120` | Default seconds to wait when `healthcheck.wait` is enabled (per-container override via `healthcheck.timeout`). |
+| `HEALTHCHECK_INTERVAL` | `2` | Poll interval in seconds while waiting for healthy. |
+| `ROLLBACK_DEFAULT` | `false` | When `true`, rollback applies to every container even without the `rollback` label. |
 | `MAINTENANCE_WINDOW` | _(none)_ | Only run during this time window (e.g. `02:00-06:00`). Midnight-spanning works: `22:00-04:00`. Dry-run bypasses this. |
 | `VERBOSE` | `false` | Log containers skipped due to missing hoist labels. Auto-enabled by `--dry-run`. |
 | `CURL_TIMEOUT` | `30` | Maximum time in seconds for webhook HTTP requests. |
@@ -140,6 +143,9 @@ services:
       com.sumguy.hoist.pause_until: "2026-06-01"          # skip until this date/datetime
       com.sumguy.hoist.constraint: "^1.2"                 # semver pin (^, ~, >=, <=, >, <, =)
       com.sumguy.hoist.group: "db"                        # any group member's pull failure aborts the rest
+      com.sumguy.hoist.healthcheck.wait: "true"           # poll for healthy after recreate
+      com.sumguy.hoist.healthcheck.timeout: "180"         # seconds to wait (overrides config)
+      com.sumguy.hoist.rollback: "true"                   # re-tag prior SHA on update or healthcheck failure
 ```
 
 `update` and `notify` can both be set on the same container — it will update and then notify.
@@ -176,6 +182,13 @@ Three labels gate whether an update is applied (notifications still fire so you 
 ### Container filters
 
 `--only foo,bar` and `--exclude baz,qux` filter which running containers hoist processes. `--exclude` wins over `--only`. Names that aren't currently running emit a warning but don't fail the run. Filters apply before label inspection — useful for ad-hoc maintenance without editing labels.
+
+### Healthcheck wait + rollback
+
+Two opt-in safety nets stack on top of the normal `compose up` flow:
+
+- **`healthcheck.wait`** — after `compose up` succeeds, hoist polls `docker inspect --format '{{.State.Health.Status}}'` (or `.State.Status` if the image has no `HEALTHCHECK`). Reaches `healthy`/`running`: success. `unhealthy`/`exited`/timeout: emits the `unhealthy` token. Per-container `healthcheck.timeout` overrides the global `HEALTHCHECK_TIMEOUT` (default 120s, polled every `HEALTHCHECK_INTERVAL` seconds — default 2).
+- **`rollback`** — on update failure OR unhealthy outcome, hoist re-aliases the prior image SHA back onto the original tag and re-runs `compose up --no-pull`. Emits `rolled_back` on success, `rollback_failed` on failure. **Caveat:** the old image must still be present locally. If `PRUNE_IMAGES=true` removed it between runs, rollback fails clearly with `rollback_failed` rather than silently. Set `ROLLBACK_DEFAULT=true` in config to enable rollback for every container without per-container labels.
 
 ## Custom scripts
 

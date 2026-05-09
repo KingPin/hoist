@@ -24,6 +24,9 @@ GLOBAL_MATRIX_TOKEN=""
 HEALTHCHECKS_PING_URL=""
 WEBHOOK_ROLLUP="false"
 WEBHOOK_ROLLUP_CHANNELS="discord,slack,generic"
+HEALTHCHECK_TIMEOUT=120
+HEALTHCHECK_INTERVAL=2
+ROLLBACK_DEFAULT="false"
 MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
@@ -176,6 +179,7 @@ setup_environment() {
     export GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_NTFY_TOKEN GLOBAL_TEAMS_WEBHOOK
     export GLOBAL_MATRIX_HOMESERVER GLOBAL_MATRIX_ROOM_ID GLOBAL_MATRIX_TOKEN
     export HEALTHCHECKS_PING_URL WEBHOOK_ROLLUP WEBHOOK_ROLLUP_CHANNELS
+    export HEALTHCHECK_TIMEOUT HEALTHCHECK_INTERVAL ROLLBACK_DEFAULT
 }
 
 check_maintenance_window() {
@@ -290,6 +294,56 @@ _check_pause_until() {
     }
     now=$(date +%s)
     (( now >= target ))
+}
+
+# _wait_for_healthy <container> <timeout_seconds>
+#   0 = container reached healthy / running
+#   1 = unhealthy, exited, or timed out
+_wait_for_healthy() {
+    local container="$1" timeout="$2"
+    local interval="${HEALTHCHECK_INTERVAL:-2}"
+    local deadline=$(( $(date +%s) + timeout ))
+    local status
+    while (( $(date +%s) < deadline )); do
+        status=$("${DOCKER_BINARY}" inspect --format \
+            '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+            "$container" 2>/dev/null) || return 1
+        case "$status" in
+            healthy|running) return 0 ;;
+            unhealthy|exited|dead) return 1 ;;
+            starting|created|restarting|paused) ;;
+            *) ;;
+        esac
+        sleep "$interval"
+    done
+    return 1
+}
+
+# _rollback_container <container> <workdir> <service> <image_name> <old_image_sha>
+#   Re-aliases the previous image SHA back onto the original tag and re-runs compose up.
+#   Requires the old image to still be present locally (PRUNE_IMAGES may have removed it).
+_rollback_container() {
+    local container="$1" workdir="$2" service="$3" image_name="$4" old_sha="$5"
+    if [[ -z "$old_sha" ]]; then
+        log "$container: rollback skipped — old image SHA unknown"
+        return 1
+    fi
+    if ! "${DOCKER_BINARY}" image inspect "$old_sha" >/dev/null 2>&1; then
+        log "$container: rollback failed — old image $old_sha no longer present locally (was it pruned?)"
+        return 1
+    fi
+    log "$container: rolling back to $old_sha"
+    if ! "${DOCKER_BINARY}" tag "$old_sha" "$image_name"; then
+        log "$container: rollback failed — could not re-tag $old_sha as $image_name"
+        return 1
+    fi
+    # Re-run compose up without pulling — picks up the now-aliased image.
+    if ! ( cd "$workdir" 2>/dev/null && "${DOCKER_BINARY}" compose up -d --no-pull "$service" ) >/dev/null 2>&1; then
+        log "$container: rollback failed — compose up did not succeed"
+        return 1
+    fi
+    log "$container: rollback complete"
+    return 0
 }
 
 _sha256() {
@@ -1310,6 +1364,7 @@ process_container() {
     local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
     local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
     local hoist_pause_until hoist_constraint hoist_group
+    local hoist_healthcheck_wait hoist_healthcheck_timeout hoist_rollback
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
@@ -1342,7 +1397,10 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).matrix.token"]       // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).pause_until"]        // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).constraint"]         // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).group"]              // "")
+        (.Config.Labels["com.sumguy.hoist\($tag).group"]              // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.wait"]    // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.timeout"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).rollback"]            // "")
     ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
     readarray -t _vals <<< "$_jq_out"
 
@@ -1373,6 +1431,9 @@ process_container() {
     hoist_pause_until="${_vals[24]}"
     hoist_constraint="${_vals[25]}"
     hoist_group="${_vals[26]}"
+    hoist_healthcheck_wait="${_vals[27]}"
+    hoist_healthcheck_timeout="${_vals[28]}"
+    hoist_rollback="${_vals[29]}"
 
     local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
     local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
@@ -1498,17 +1559,49 @@ process_container() {
                     "${hoist_script_update[@]}"
                 fi
                 log "$container_name: Updating container..."
+                local _rollback_enabled=false
+                if [[ $hoist_rollback == true ]] || [[ -z $hoist_rollback && $ROLLBACK_DEFAULT == true ]]; then
+                    _rollback_enabled=true
+                fi
+                local _hc_timeout="${hoist_healthcheck_timeout:-$HEALTHCHECK_TIMEOUT}"
+                local _update_ok=false _hc_ok=true
                 if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
+                    _update_ok=true
+                    if [[ $hoist_healthcheck_wait == true ]]; then
+                        log "$container_name: Waiting up to ${_hc_timeout}s for healthy..."
+                        if ! _wait_for_healthy "$container_name" "$_hc_timeout"; then
+                            _hc_ok=false
+                            log "$container_name: container failed healthcheck after update"
+                        fi
+                    fi
+                fi
+
+                if [[ $_update_ok == true && $_hc_ok == true ]]; then
                     status="✅ Update succeeded"
                     status_generic="update_success"
                     color=3066993
                     _tokens+=("updated")
                 else
-                    log "$container_name: Update failed"
-                    status="❌ Update failed"
-                    status_generic="update_failure"
+                    if [[ $_update_ok == true && $_hc_ok != true ]]; then
+                        status="❌ Update unhealthy"
+                        status_generic="update_failure"
+                        _tokens+=("unhealthy")
+                    else
+                        log "$container_name: Update failed"
+                        status="❌ Update failed"
+                        status_generic="update_failure"
+                        _tokens+=("update_failed")
+                    fi
                     color=15158332
-                    _tokens+=("update_failed")
+                    if [[ $_rollback_enabled == true ]]; then
+                        if _rollback_container "$container_name" "$docker_compose_workdir" "$docker_compose_service" "$image_name" "$container_image_digest"; then
+                            _tokens+=("rolled_back")
+                            status+=" (rolled back)"
+                        else
+                            _tokens+=("rollback_failed")
+                            status+=" (rollback failed)"
+                        fi
+                    fi
                 fi
                 rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
@@ -1592,6 +1685,7 @@ print_summary() {
     local updated=0 update_failed=0 notified=0 no_change=0 skipped=0
     local would_update=0 would_notify=0
     local paused=0 constraint_blocked=0 group_aborted=0
+    local unhealthy=0 rolled_back=0 rollback_failed=0
     local f token
     for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
         [[ -f $f ]] || continue
@@ -1607,6 +1701,9 @@ print_summary() {
                 paused)             (( paused++ )) ;;
                 constraint_blocked) (( constraint_blocked++ )) ;;
                 group_aborted)      (( group_aborted++ )) ;;
+                unhealthy)          (( unhealthy++ )) ;;
+                rolled_back)        (( rolled_back++ )) ;;
+                rollback_failed)    (( rollback_failed++ )) ;;
             esac
         done < "$f"
     done
@@ -1619,6 +1716,9 @@ print_summary() {
         [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
         msg="Run complete: ${updated_part}, ${notified} notified, ${no_change} no-change, ${skipped} skipped"
     fi
+    [[ $unhealthy -gt 0 ]]          && msg+=", ${unhealthy} unhealthy"
+    [[ $rolled_back -gt 0 ]]        && msg+=", ${rolled_back} rolled-back"
+    [[ $rollback_failed -gt 0 ]]    && msg+=", ${rollback_failed} ROLLBACK-FAILED"
     [[ $paused -gt 0 ]]             && msg+=", ${paused} paused"
     [[ $constraint_blocked -gt 0 ]] && msg+=", ${constraint_blocked} constraint-blocked"
     [[ $group_aborted -gt 0 ]]      && msg+=", ${group_aborted} group-aborted"
@@ -1765,8 +1865,8 @@ if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     "${DOCKER_BINARY}" image prune --force
 fi
 
-# HC.io ping: /fail if any update_failed token, success otherwise
-if grep -lq '^update_failed$' "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null; then
+# HC.io ping: /fail if any update_failed / unhealthy / rollback_failed token, success otherwise
+if grep -Elq '^(update_failed|unhealthy|rollback_failed)$' "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null; then
     _hc_ping fail
 else
     _hc_ping
