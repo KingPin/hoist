@@ -6,9 +6,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/KingPin/hoist/master/install.sh | less
 #
 # Env vars:
-#   HOIST_VERSION  Pin to a release tag (e.g. v1.2.0). Default: latest release.
-#   INSTALL_DIR    Where to install the binary. Default: /usr/local/bin
-#   CONFIG_DIR     Where to install config files. Default: /etc/hoist
+#   HOIST_VERSION         Pin to a release tag (e.g. v1.2.0). Default: latest release.
+#   INSTALL_DIR           Where to install the binary. Default: /usr/local/bin
+#   CONFIG_DIR            Where to install config files. Default: /etc/hoist
+#   HOIST_NONINTERACTIVE  Set to 1 to skip the post-install scheduling prompt.
 
 set -euo pipefail
 
@@ -144,3 +145,11 @@ else
 fi
 echo "  - Add com.sumguy.hoist.* labels to containers you want managed"
 echo "  - Docs: https://github.com/${HOIST_REPO}#usage"
+
+if [[ -t 0 && -t 1 && "${HOIST_NONINTERACTIVE:-0}" != 1 ]]; then
+    echo
+    read -rp "Install a scheduled run for hoist now? [y/N] " _setup_ans
+    if [[ ${_setup_ans,,} == y ]]; then
+        exec "${INSTALL_DIR}/hoist" --cron install
+    fi
+fi
