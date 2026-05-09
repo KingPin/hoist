@@ -27,6 +27,14 @@ CLI flags always override config file values.
 | `GLOBAL_DISCORD_WEBHOOK` | _(none)_ | Fallback Discord webhook for containers without a per-container label |
 | `GLOBAL_SLACK_WEBHOOK` | _(none)_ | Fallback Slack webhook |
 | `GLOBAL_GENERIC_WEBHOOK` | _(none)_ | Fallback generic webhook |
+| `GLOBAL_TELEGRAM_BOT_TOKEN` / `GLOBAL_TELEGRAM_CHAT_ID` | _(none)_ | Fallback Telegram bot credentials |
+| `GLOBAL_GOTIFY_URL` | _(none)_ | Fallback Gotify message URL (`?token=` in URL) |
+| `GLOBAL_NTFY_URL` / `GLOBAL_NTFY_TOKEN` | _(none)_ | Fallback ntfy.sh topic URL and optional bearer token |
+| `GLOBAL_TEAMS_WEBHOOK` | _(none)_ | Fallback Microsoft Teams incoming webhook |
+| `GLOBAL_MATRIX_HOMESERVER` / `GLOBAL_MATRIX_ROOM_ID` / `GLOBAL_MATRIX_TOKEN` | _(none)_ | Fallback Matrix room credentials |
+| `HEALTHCHECKS_PING_URL` | _(none)_ | Healthchecks.io heartbeat URL — pinged at start (`/start`), end (success), or `/fail` if any update failed |
+| `WEBHOOK_ROLLUP` | `false` | Send one summary webhook per run instead of per-container, for listed channels |
+| `WEBHOOK_ROLLUP_CHANNELS` | `discord,slack,generic` | Comma list of channels to roll up. Per-container labels are ignored for rolled-up channels. |
 | `MAINTENANCE_WINDOW` | _(none)_ | Only run during this time window (e.g. `02:00-06:00`). Midnight-spanning works: `22:00-04:00`. Dry-run bypasses this. |
 | `VERBOSE` | `false` | Log containers skipped due to missing hoist labels. Auto-enabled by `--dry-run`. |
 | `CURL_TIMEOUT` | `30` | Maximum time in seconds for webhook HTTP requests. |
@@ -73,7 +81,7 @@ For system-wide config, place `hoist.conf` at `/etc/hoist/hoist.conf`.
 
 - Docker with the `compose` subcommand (`docker compose`)
 - `jq`
-- Bash 4+ (macOS ships 3.2 by default — `brew install bash`)
+- Bash 4.3+ (macOS ships 3.2 by default — `brew install bash`)
 
 ## Usage
 
@@ -115,6 +123,15 @@ services:
       com.sumguy.hoist.discord.webhook: "https://discord.com/api/webhooks/..."
       com.sumguy.hoist.slack.webhook: "https://hooks.slack.com/services/..."
       com.sumguy.hoist.generic.webhook: "https://example.com/webhook"
+      com.sumguy.hoist.telegram.bot_token: "123456:ABC..."
+      com.sumguy.hoist.telegram.chat_id: "-1001234567890"
+      com.sumguy.hoist.gotify.url: "https://gotify.example.com/message?token=XXX"
+      com.sumguy.hoist.ntfy.url: "https://ntfy.sh/your-topic"
+      com.sumguy.hoist.ntfy.token: "tk_..."    # optional bearer token
+      com.sumguy.hoist.teams.webhook: "https://outlook.office.com/webhook/..."
+      com.sumguy.hoist.matrix.homeserver: "https://matrix.org"
+      com.sumguy.hoist.matrix.room_id: "!abc123:matrix.org"
+      com.sumguy.hoist.matrix.token: "syt_..."
       com.sumguy.hoist.script.update: "/opt/scripts/pre-update.sh"
       com.sumguy.hoist.script.notify: "/opt/scripts/on-notify.sh"
       com.sumguy.hoist.registry.authfile: "/run/secrets/registry.json"
@@ -218,6 +235,22 @@ On macOS, hoist points you at a launchd plist example. See
 **Discord** — sends a rich embed with image name, digest diff, and version/revision if the image exposes `org.opencontainers.image.version` and `org.opencontainers.image.revision` labels.
 
 **Slack** — sends a plain text message: `[container] Update available: image:tag`
+
+**Telegram** — sends a plain text message via the Bot API. Requires `bot_token` (from BotFather) and `chat_id` (negative for groups, positive for users).
+
+**Gotify** — sends a `{title, message, priority}` payload. Token goes in the URL: `https://gotify.example.com/message?token=XXX`.
+
+**ntfy** — POSTs the message body to your ntfy topic URL. Title goes in the `Title:` header. Optional `token` adds bearer auth for protected topics.
+
+**Microsoft Teams** — sends an `MessageCard` (Office 365 connector format). Use the incoming-webhook URL for your channel.
+
+**Matrix** — PUTs an `m.text` message into a room. Requires `homeserver` (e.g. `https://matrix.org`), `room_id`, and an `access_token`.
+
+**Healthchecks.io** — set `HEALTHCHECKS_PING_URL` to a check URL. Hoist pings `/start` at run start, the bare URL on success, and `/fail` if any container's update failed. Best-effort — failed pings don't block the run.
+
+### Webhook rollup
+
+Set `WEBHOOK_ROLLUP=true` (and adjust `WEBHOOK_ROLLUP_CHANNELS`) to receive one summary message per run instead of one per container. The rolled-up message is sent to the corresponding `GLOBAL_*` webhook for each listed channel. Per-container webhook labels are ignored for rolled-up channels; channels not in the rollup list keep their normal per-container behavior.
 
 **Generic webhook** — POST with JSON body:
 

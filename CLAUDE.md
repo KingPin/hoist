@@ -48,6 +48,11 @@ All behavior is controlled by Docker labels on containers:
 | `com.sumguy.hoist[.TAG].discord.webhook` | Discord embed webhook URL |
 | `com.sumguy.hoist[.TAG].generic.webhook` | Generic JSON webhook URL |
 | `com.sumguy.hoist[.TAG].slack.webhook` | Slack incoming webhook URL |
+| `com.sumguy.hoist[.TAG].telegram.bot_token` / `.telegram.chat_id` | Telegram bot credentials |
+| `com.sumguy.hoist[.TAG].gotify.url` | Gotify message URL (token in query string) |
+| `com.sumguy.hoist[.TAG].ntfy.url` / `.ntfy.token` | ntfy.sh topic URL + optional bearer token |
+| `com.sumguy.hoist[.TAG].teams.webhook` | Microsoft Teams incoming webhook |
+| `com.sumguy.hoist[.TAG].matrix.homeserver` / `.matrix.room_id` / `.matrix.token` | Matrix room credentials |
 | `com.sumguy.hoist[.TAG].script.update` | Shell command run before container recreate |
 | `com.sumguy.hoist[.TAG].script.notify` | Shell command run before webhook notification |
 | `com.sumguy.hoist[.TAG].registry.authfile` | JSON file with `username`, `password`, `registry` |
@@ -103,6 +108,12 @@ Privilege handling lives in `_sudo_if_needed` (`hoist.sh:461-475`): walks up to 
 
 A worked Ansible playbook that drives `--cron install` through this contract lives in `examples/ansible/`.
 
-### Parallel mode caveat
+### Parallel mode
 
-When `--parallel N` (N > 1) is used, functions and variables are exported via `export -f` so subshells spawned by `xargs` can access them. The canonical export list lives in `setup_environment` (hoist.sh) — any new helper function called from `process_container` (or its callees) must be added there, or it will silently break in parallel mode while still working serially.
+`--parallel N` uses a bash worker pool (`process_container "$c" &` + `wait -n`) inside the same shell process. Forked subshells inherit functions and variables natively, so no `export -f` is needed — new helpers Just Work. Bash 4.3+ is required for `wait -n`. Per-container state goes through cache files (`.notified`, `.run-result`, `.rollup`) since variables modified in a `&` subshell don't propagate back to the parent.
+
+### Notification channels and rollup
+
+Per-container labels: discord, slack, generic, telegram, gotify, ntfy, teams, matrix. Each channel also has a `GLOBAL_*` fallback in config. When `WEBHOOK_ROLLUP=true`, channels listed in `WEBHOOK_ROLLUP_CHANNELS` get one summary message at end of run (using the `GLOBAL_*` URL) instead of per-container sends — per-container labels for those channels are ignored.
+
+`HEALTHCHECKS_PING_URL` triggers a `/start` ping at run start, the bare URL on success at run end, or `/fail` if any container's update failed. Best-effort.

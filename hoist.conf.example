@@ -37,6 +37,28 @@
 # GLOBAL_SLACK_WEBHOOK=https://hooks.slack.com/services/...
 # GLOBAL_GENERIC_WEBHOOK=https://example.com/webhook
 
+# Additional channels (all optional). Each has matching per-container labels.
+# GLOBAL_TELEGRAM_BOT_TOKEN=123456:ABC...
+# GLOBAL_TELEGRAM_CHAT_ID=-1001234567890     # group chat IDs are negative
+# GLOBAL_GOTIFY_URL=https://gotify.example.com/message?token=XXX
+# GLOBAL_NTFY_URL=https://ntfy.sh/your-topic
+# GLOBAL_NTFY_TOKEN=tk_...                   # optional, for protected topics
+# GLOBAL_TEAMS_WEBHOOK=https://outlook.office.com/webhook/...
+# GLOBAL_MATRIX_HOMESERVER=https://matrix.org
+# GLOBAL_MATRIX_ROOM_ID=!abc123:matrix.org
+# GLOBAL_MATRIX_TOKEN=syt_...
+
+# Healthchecks.io heartbeat URL. Hoist pings <URL>/start at run start, the bare
+# URL on success, and <URL>/fail if any container's update failed. Best-effort.
+# HEALTHCHECKS_PING_URL=https://hc-ping.com/<uuid>
+
+# Webhook rollup mode — when true, suppress per-container webhooks for the listed
+# channels and instead send a single summary webhook at the end of the run, using
+# the corresponding GLOBAL_* URL. Per-container webhook labels are ignored for
+# rolled-up channels. Channels not listed here continue to send per-container.
+# WEBHOOK_ROLLUP=true
+# WEBHOOK_ROLLUP_CHANNELS=discord,slack,generic,telegram,gotify,ntfy,teams,matrix
+
 # Self-update behavior on every run: "notify", "update", or "off" (default: notify)
 #   notify — print to console + send to configured webhooks if a newer version exists
 #   update — automatically apply updates (no prompt); still fires configured webhooks before applying

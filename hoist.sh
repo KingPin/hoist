@@ -12,6 +12,18 @@ LOG_FILE=""
 GLOBAL_DISCORD_WEBHOOK=""
 GLOBAL_SLACK_WEBHOOK=""
 GLOBAL_GENERIC_WEBHOOK=""
+GLOBAL_TELEGRAM_BOT_TOKEN=""
+GLOBAL_TELEGRAM_CHAT_ID=""
+GLOBAL_GOTIFY_URL=""
+GLOBAL_NTFY_URL=""
+GLOBAL_NTFY_TOKEN=""
+GLOBAL_TEAMS_WEBHOOK=""
+GLOBAL_MATRIX_HOMESERVER=""
+GLOBAL_MATRIX_ROOM_ID=""
+GLOBAL_MATRIX_TOKEN=""
+HEALTHCHECKS_PING_URL=""
+WEBHOOK_ROLLUP="false"
+WEBHOOK_ROLLUP_CHANNELS="discord,slack,generic"
 MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
@@ -134,7 +146,9 @@ if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
 fi
 
-for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK; do
+for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK \
+               GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_TEAMS_WEBHOOK \
+               GLOBAL_MATRIX_HOMESERVER HEALTHCHECKS_PING_URL; do
     _wh_val="${!_wh_var}"
     if [[ -n "$_wh_val" ]]; then
         [[ "$_wh_val" =~ ^https?:// ]] || { echo "Error: $_wh_var is not a valid http(s) URL: $_wh_val"; exit 1; }
@@ -150,6 +164,10 @@ setup_environment() {
     export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE CURL_TIMEOUT
     export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
+    export GLOBAL_TELEGRAM_BOT_TOKEN GLOBAL_TELEGRAM_CHAT_ID
+    export GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_NTFY_TOKEN GLOBAL_TEAMS_WEBHOOK
+    export GLOBAL_MATRIX_HOMESERVER GLOBAL_MATRIX_ROOM_ID GLOBAL_MATRIX_TOKEN
+    export HEALTHCHECKS_PING_URL WEBHOOK_ROLLUP WEBHOOK_ROLLUP_CHANNELS
 }
 
 check_maintenance_window() {
@@ -1064,6 +1082,150 @@ send_slack_notification() {
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
 }
 
+# send_telegram_notification <text> <bot_token> <chat_id>
+send_telegram_notification() {
+    local text="$1" token="$2" chat_id="$3"
+    [[ -n $token && -n $chat_id ]] || { log "Telegram: missing bot_token or chat_id"; return 1; }
+    local payload
+    payload=$(jq -n --arg text "$text" --arg chat "$chat_id" \
+        '{"chat_id":$chat,"text":$text,"disable_web_page_preview":true}')
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" \
+        "https://api.telegram.org/bot${token}/sendMessage"
+}
+
+# send_gotify_notification <title> <message> <url>  (url may include ?token=...)
+send_gotify_notification() {
+    local title="$1" message="$2" url="$3"
+    validate_webhook_url "$url" || return 1
+    local payload
+    payload=$(jq -n --arg t "$title" --arg m "$message" \
+        '{"title":$t,"message":$m,"priority":5}')
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$url"
+}
+
+# send_ntfy_notification <title> <message> <url> [token]
+send_ntfy_notification() {
+    local title="$1" message="$2" url="$3" token="${4:-}"
+    validate_webhook_url "$url" || return 1
+    local -a hdrs=(-H "User-Agent: Hoist" -H "Title: $title" -H "Priority: default")
+    [[ -n $token ]] && hdrs+=(-H "Authorization: Bearer $token")
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        "${hdrs[@]}" -d "$message" "$url"
+}
+
+# send_teams_notification <title> <message> <webhook>
+send_teams_notification() {
+    local title="$1" message="$2" webhook="$3"
+    validate_webhook_url "$webhook" || return 1
+    local payload
+    payload=$(jq -n --arg t "$title" --arg m "$message" \
+        '{"@type":"MessageCard","@context":"https://schema.org/extensions",
+          "summary":$t,"themeColor":"0076D7","title":$t,"text":$m}')
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
+}
+
+# send_matrix_notification <message> <homeserver> <room_id> <access_token>
+send_matrix_notification() {
+    local message="$1" homeserver="$2" room_id="$3" token="$4"
+    [[ -n $homeserver && -n $room_id && -n $token ]] || { log "Matrix: missing homeserver/room_id/token"; return 1; }
+    validate_webhook_url "$homeserver" || return 1
+    local txn url payload
+    txn="hoist-$(date +%s%N)-$$"
+    url="${homeserver%/}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn}"
+    payload=$(jq -n --arg body "$message" '{"msgtype":"m.text","body":$body}')
+    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
+        -H "User-Agent: Hoist" -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" -d "$payload" "$url"
+}
+
+# _hc_ping [start|fail|""]  (suffix optional; empty = success)
+_hc_ping() {
+    [[ -n $HEALTHCHECKS_PING_URL ]] || return 0
+    local suffix="${1:-}" url="${HEALTHCHECKS_PING_URL%/}"
+    [[ -n $suffix ]] && url="${url}/${suffix}"
+    curl -fsSL --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
+}
+
+# _skip_for_rollup <channel>  -> 0 if per-container send should be skipped (rollup will handle it)
+_skip_for_rollup() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 1
+    [[ ",${WEBHOOK_ROLLUP_CHANNELS}," == *",$1,"* ]]
+}
+
+# write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
+write_rollup_entry() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 0
+    local safe
+    safe=$(printf '%s' "$2" | tr -cs '[:alnum:]._-' '_')
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" \
+        > "${CACHE_LOCATION}/hoist-${safe}.rollup"
+}
+
+# Aggregate all .rollup files into a single multi-line summary, send to each rollup channel
+send_rollup_notifications() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 0
+    local f lines=""
+    for f in "${CACHE_LOCATION}"/hoist-*.rollup; do
+        [[ -f $f ]] || continue
+        local status container image old new
+        IFS=$'\t' read -r status container image old new < "$f"
+        local short_old="${old:0:11}" short_new="${new:0:11}"
+        lines+="• [${status}] ${container} (${image}) ${short_old} → ${short_new}"$'\n'
+    done
+    [[ -z $lines ]] && return 0
+    local title="Hoist run summary"
+    local message="${title}"$'\n'"${lines%$'\n'}"
+
+    local ch
+    IFS=',' read -ra _rollup_channels <<< "$WEBHOOK_ROLLUP_CHANNELS"
+    for ch in "${_rollup_channels[@]}"; do
+        case "$ch" in
+            discord)
+                [[ -n $GLOBAL_DISCORD_WEBHOOK ]] || continue
+                log "Rollup: sending Discord summary..."
+                send_discord_notification "$title" "rollup" "" "" "$message" \
+                    "$GLOBAL_DISCORD_WEBHOOK" "" "" "" "" 768753 || true ;;
+            slack)
+                [[ -n $GLOBAL_SLACK_WEBHOOK ]] || continue
+                log "Rollup: sending Slack summary..."
+                send_slack_notification "$message" "$GLOBAL_SLACK_WEBHOOK" || true ;;
+            generic)
+                [[ -n $GLOBAL_GENERIC_WEBHOOK ]] || continue
+                log "Rollup: sending generic webhook summary..."
+                local payload
+                payload=$(jq -n --arg type "rollup" --arg ts "$(_iso_ts)" --arg msg "$message" \
+                    '{"type":$type,"timestamp":$ts,"message":$msg}')
+                curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+                    -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+                    -d "$payload" "$GLOBAL_GENERIC_WEBHOOK" || true ;;
+            telegram)
+                [[ -n $GLOBAL_TELEGRAM_BOT_TOKEN && -n $GLOBAL_TELEGRAM_CHAT_ID ]] || continue
+                log "Rollup: sending Telegram summary..."
+                send_telegram_notification "$message" "$GLOBAL_TELEGRAM_BOT_TOKEN" "$GLOBAL_TELEGRAM_CHAT_ID" || true ;;
+            gotify)
+                [[ -n $GLOBAL_GOTIFY_URL ]] || continue
+                log "Rollup: sending Gotify summary..."
+                send_gotify_notification "$title" "$message" "$GLOBAL_GOTIFY_URL" || true ;;
+            ntfy)
+                [[ -n $GLOBAL_NTFY_URL ]] || continue
+                log "Rollup: sending ntfy summary..."
+                send_ntfy_notification "$title" "$message" "$GLOBAL_NTFY_URL" "$GLOBAL_NTFY_TOKEN" || true ;;
+            teams)
+                [[ -n $GLOBAL_TEAMS_WEBHOOK ]] || continue
+                log "Rollup: sending Teams summary..."
+                send_teams_notification "$title" "$message" "$GLOBAL_TEAMS_WEBHOOK" || true ;;
+            matrix)
+                [[ -n $GLOBAL_MATRIX_HOMESERVER && -n $GLOBAL_MATRIX_ROOM_ID && -n $GLOBAL_MATRIX_TOKEN ]] || continue
+                log "Rollup: sending Matrix summary..."
+                send_matrix_notification "$message" "$GLOBAL_MATRIX_HOMESERVER" \
+                    "$GLOBAL_MATRIX_ROOM_ID" "$GLOBAL_MATRIX_TOKEN" || true ;;
+        esac
+    done
+}
+
 process_container() {
     local container_name="$1"
     local safe_name
@@ -1082,6 +1244,9 @@ process_container() {
     local docker_compose_service docker_compose_version docker_compose_workdir
     local old_oci_version old_oci_revision
     local hoist_update hoist_notify hoist_discord_webhook hoist_generic_webhook hoist_slack_webhook
+    local hoist_telegram_bot_token hoist_telegram_chat_id
+    local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
+    local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
@@ -1102,7 +1267,16 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).slack.webhook"]     // .Config.Labels["org.hotio.pullio\($tag).slack.webhook"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).script.update"]     // .Config.Labels["org.hotio.pullio\($tag).script.update"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).script.notify"]     // .Config.Labels["org.hotio.pullio\($tag).script.notify"]     // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // "")
+        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).telegram.bot_token"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).telegram.chat_id"]   // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).gotify.url"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).ntfy.url"]           // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).ntfy.token"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).teams.webhook"]      // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.homeserver"]  // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.room_id"]     // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.token"]       // "")
     ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
     readarray -t _vals <<< "$_jq_out"
 
@@ -1118,12 +1292,31 @@ process_container() {
     hoist_discord_webhook="${_vals[9]}"
     hoist_generic_webhook="${_vals[10]}"
     hoist_slack_webhook="${_vals[11]}"
-    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
-    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
-    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
     read -ra hoist_script_update <<< "${_vals[12]}"
     read -ra hoist_script_notify <<< "${_vals[13]}"
     hoist_registry_authfile="${_vals[14]}"
+    hoist_telegram_bot_token="${_vals[15]}"
+    hoist_telegram_chat_id="${_vals[16]}"
+    hoist_gotify_url="${_vals[17]}"
+    hoist_ntfy_url="${_vals[18]}"
+    hoist_ntfy_token="${_vals[19]}"
+    hoist_teams_webhook="${_vals[20]}"
+    hoist_matrix_homeserver="${_vals[21]}"
+    hoist_matrix_room_id="${_vals[22]}"
+    hoist_matrix_token="${_vals[23]}"
+
+    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
+    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
+    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
+    local effective_telegram_bot_token="${hoist_telegram_bot_token:-$GLOBAL_TELEGRAM_BOT_TOKEN}"
+    local effective_telegram_chat_id="${hoist_telegram_chat_id:-$GLOBAL_TELEGRAM_CHAT_ID}"
+    local effective_gotify_url="${hoist_gotify_url:-$GLOBAL_GOTIFY_URL}"
+    local effective_ntfy_url="${hoist_ntfy_url:-$GLOBAL_NTFY_URL}"
+    local effective_ntfy_token="${hoist_ntfy_token:-$GLOBAL_NTFY_TOKEN}"
+    local effective_teams_webhook="${hoist_teams_webhook:-$GLOBAL_TEAMS_WEBHOOK}"
+    local effective_matrix_homeserver="${hoist_matrix_homeserver:-$GLOBAL_MATRIX_HOMESERVER}"
+    local effective_matrix_room_id="${hoist_matrix_room_id:-$GLOBAL_MATRIX_ROOM_ID}"
+    local effective_matrix_token="${hoist_matrix_token:-$GLOBAL_MATRIX_TOKEN}"
     if [[ -n "${hoist_script_update[0]}" ]]; then
         validate_script_path "${hoist_script_update[0]}" || {
             log "$container_name: script.update label rejected; skipping"
@@ -1237,24 +1430,48 @@ process_container() {
                     export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
                     "${hoist_script_notify[@]}"
                 fi
-                if [[ -n $effective_discord ]]; then
+                local _slack_msg="[$container_name] $status: $image_name"
+                if [[ -n $effective_discord ]] && ! _skip_for_rollup discord; then
                     log "$container_name: Sending Discord notification..."
                     send_discord_notification "$status" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
                 fi
-                if [[ -n $effective_generic ]]; then
+                if [[ -n $effective_generic ]] && ! _skip_for_rollup generic; then
                     log "$container_name: Sending generic webhook..."
                     send_generic_webhook "$status_generic" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 fi
-                if [[ -n $effective_slack ]]; then
+                if [[ -n $effective_slack ]] && ! _skip_for_rollup slack; then
                     log "$container_name: Sending Slack notification..."
-                    send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
+                    send_slack_notification "$_slack_msg" "$effective_slack"
                 fi
+                if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]] && ! _skip_for_rollup telegram; then
+                    log "$container_name: Sending Telegram notification..."
+                    send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
+                fi
+                if [[ -n $effective_gotify_url ]] && ! _skip_for_rollup gotify; then
+                    log "$container_name: Sending Gotify notification..."
+                    send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
+                fi
+                if [[ -n $effective_ntfy_url ]] && ! _skip_for_rollup ntfy; then
+                    log "$container_name: Sending ntfy notification..."
+                    send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
+                fi
+                if [[ -n $effective_teams_webhook ]] && ! _skip_for_rollup teams; then
+                    log "$container_name: Sending Teams notification..."
+                    send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
+                fi
+                if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]] && ! _skip_for_rollup matrix; then
+                    log "$container_name: Sending Matrix notification..."
+                    send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
+                        "$effective_matrix_room_id" "$effective_matrix_token"
+                fi
+                write_rollup_entry "$status_generic" "$container_name" "$image_name" \
+                    "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
                 _tokens+=("notified")
             fi
@@ -1348,8 +1565,6 @@ list_containers() {
     done
 }
 
-trap 'exit 130' INT
-
 if [[ $DO_CRON == true ]]; then
     _cron_dispatch
 fi
@@ -1370,9 +1585,10 @@ if [[ $DO_LIST == true ]]; then
     exit 0
 fi
 
-rm -f "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null || true
+rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup 2>/dev/null || true
 setup_environment
 check_maintenance_window
+_hc_ping start
 
 log "Processing ${#containers[@]} containers (parallelism: $PARALLEL)"
 
@@ -1394,8 +1610,16 @@ else
 fi
 
 print_summary
+send_rollup_notifications
 
 if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     log "Pruning docker images..."
     "${DOCKER_BINARY}" image prune --force
+fi
+
+# HC.io ping: /fail if any update_failed token, success otherwise
+if grep -lq '^update_failed$' "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null; then
+    _hc_ping fail
+else
+    _hc_ping
 fi
