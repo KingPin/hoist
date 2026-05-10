@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.5.0"
+HOIST_VERSION="1.5.1"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -576,7 +576,7 @@ _self_update_check() {
         return 0
     fi
 
-    local latest_tag latest_version release_url asset_url sha256_url
+    local latest_tag latest_version release_url asset_url sha256_url release_body
     latest_tag=$(jq -r '.tag_name // empty' <<< "$api_response")
     [[ -z $latest_tag ]] && {
         if [[ $interactive == true ]]; then log "Error: malformed API response"; exit 1; fi
@@ -587,6 +587,7 @@ _self_update_check() {
     [[ -z $release_url ]] && release_url="https://github.com/${HOIST_REPO}/releases/tag/v${latest_version}"
     asset_url=$(jq -r '.assets[] | select(.name == "hoist.sh") | .browser_download_url' <<< "$api_response")
     sha256_url=$(jq -r '.assets[] | select(.name == "hoist.sh.sha256") | .browser_download_url' <<< "$api_response")
+    release_body=$(jq -r '.body // empty' <<< "$api_response")
     if [[ -z $asset_url || -z $sha256_url ]]; then
         if [[ $interactive == true ]]; then
             log "Error: release v${latest_version} is missing hoist.sh or hoist.sh.sha256 assets"
@@ -623,6 +624,10 @@ _self_update_check() {
                 log "Auto-update to v${latest_version} failed — continuing container management"
         fi
         return 0
+    fi
+
+    if [[ -n $release_body ]]; then
+        printf '\n%s\n\n' "$(sed 's/^/  /' <<< "$release_body" | head -30)"
     fi
 
     if [[ $DRY_RUN == true ]]; then
