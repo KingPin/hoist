@@ -1295,10 +1295,24 @@ _hc_ping() {
     curl -fsSL --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
 }
 
-# _skip_for_rollup <channel>  -> 0 if per-container send should be skipped (rollup will handle it)
+# _skip_for_rollup <channel>  -> 0 if per-container send should be skipped
+# (rollup will handle it). Falls back to per-container send when rollup is
+# enabled but the channel's GLOBAL_* fallback is unset, so users with only
+# per-container labels still get notifications.
 _skip_for_rollup() {
     [[ $WEBHOOK_ROLLUP == true ]] || return 1
-    [[ ",${WEBHOOK_ROLLUP_CHANNELS}," == *",$1,"* ]]
+    [[ ",${WEBHOOK_ROLLUP_CHANNELS}," == *",$1,"* ]] || return 1
+    case "$1" in
+        discord)  [[ -n $GLOBAL_DISCORD_WEBHOOK ]] ;;
+        slack)    [[ -n $GLOBAL_SLACK_WEBHOOK ]] ;;
+        generic)  [[ -n $GLOBAL_GENERIC_WEBHOOK ]] ;;
+        telegram) [[ -n $GLOBAL_TELEGRAM_BOT_TOKEN && -n $GLOBAL_TELEGRAM_CHAT_ID ]] ;;
+        gotify)   [[ -n $GLOBAL_GOTIFY_URL ]] ;;
+        ntfy)     [[ -n $GLOBAL_NTFY_URL ]] ;;
+        teams)    [[ -n $GLOBAL_TEAMS_WEBHOOK ]] ;;
+        matrix)   [[ -n $GLOBAL_MATRIX_HOMESERVER && -n $GLOBAL_MATRIX_ROOM_ID && -n $GLOBAL_MATRIX_TOKEN ]] ;;
+        *)        return 1 ;;
+    esac
 }
 
 # write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
