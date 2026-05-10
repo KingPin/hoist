@@ -376,8 +376,12 @@ _rollback_container() {
         log "$container: rollback failed — could not re-tag $old_sha as $image_name"
         return 1
     fi
+    if [[ ! -d $workdir ]]; then
+        log "$container: rollback failed — compose workdir '$workdir' is missing"
+        return 1
+    fi
     # Re-run compose up without pulling — picks up the now-aliased image.
-    if ! ( cd "$workdir" 2>/dev/null && "${DOCKER_BINARY}" compose up -d --no-pull "$service" ) >/dev/null 2>&1; then
+    if ! ( cd "$workdir" && "${DOCKER_BINARY}" compose up -d --no-pull "$service" ) >/dev/null 2>&1; then
         log "$container: rollback failed — compose up did not succeed"
         return 1
     fi
