@@ -155,7 +155,9 @@ if [[ -z ${BASH_VERSINFO+x} ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] =
     exit 1
 fi
 
-trap 'kill 0 2>/dev/null; exit 130' INT TERM
+# Tear down only the background workers we spawned, not the entire process
+# group — `kill 0` would also signal shell siblings (e.g. the cron parent).
+trap '_jobs=$(jobs -p); [[ -n "$_jobs" ]] && kill $_jobs 2>/dev/null; exit 130' INT TERM
 
 if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
