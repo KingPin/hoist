@@ -83,6 +83,10 @@ On every run (unless `UPDATE_CHECK=off`), `_self_update_check` queries the GitHu
 
 `--update` invokes the same path interactively (prompts before replacing; `--force` skips the prompt; `--dry-run` shows what would happen without writing). HTTP errors are distinguished: `000` = network failure, `404` = no releases yet, other non-200 = API error.
 
+### Release process
+
+`HOIST_VERSION` (`hoist.sh:2`) is the source of truth. Cutting a release: bump `HOIST_VERSION`, merge to `master`, then `git tag -a vX.Y.Z <merge-commit> && git push origin vX.Y.Z`. The `release.yml` workflow (triggered on `v*` tags) checks out the tag, generates `hoist.sh.sha256` + `hoist.conf.example.sha256`, and creates the GitHub release with all four files attached and auto-generated notes. **Do not run `gh release create` manually** — the workflow does it on tag push and a manual call will 422. Use `gh release edit` to refine the auto-generated body.
+
 ### List mode
 
 `--list`/`--status` short-circuits after container discovery: it calls `list_containers` (a parallel jq parse + cached-digest lookup) and exits before `setup_environment`, the maintenance-window check, or any pulls.
