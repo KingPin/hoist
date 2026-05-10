@@ -1852,11 +1852,17 @@ if [[ -n "$ONLY_LIST" || -n "$EXCLUDE_LIST" ]]; then
     declare -A _only_set _exclude_set
     if [[ -n "$ONLY_LIST" ]]; then
         IFS=',' read -ra _only_arr <<< "$ONLY_LIST"
-        for n in "${_only_arr[@]}"; do n="${n## }"; n="${n%% }"; [[ -n "$n" ]] && _only_set[$n]=1; done
+        for n in "${_only_arr[@]}"; do
+            [[ "$n" =~ ^[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] && n="${BASH_REMATCH[1]}" || n=""
+            [[ -n "$n" ]] && _only_set[$n]=1
+        done
     fi
     if [[ -n "$EXCLUDE_LIST" ]]; then
         IFS=',' read -ra _excl_arr <<< "$EXCLUDE_LIST"
-        for n in "${_excl_arr[@]}"; do n="${n## }"; n="${n%% }"; [[ -n "$n" ]] && _exclude_set[$n]=1; done
+        for n in "${_excl_arr[@]}"; do
+            [[ "$n" =~ ^[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] && n="${BASH_REMATCH[1]}" || n=""
+            [[ -n "$n" ]] && _exclude_set[$n]=1
+        done
     fi
     declare -a _filtered=()
     declare -A _seen_names=()
