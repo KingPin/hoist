@@ -70,10 +70,14 @@ while [[ "$1" != "" ]]; do
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
     --list|--status) DO_LIST=true ;;
-    --only=*)     ONLY_LIST="${1#*=}" ;;
-    --only)       shift; [[ -n "$1" && "$1" != "--"* ]] && ONLY_LIST="$1" ;;
-    --exclude=*)  EXCLUDE_LIST="${1#*=}" ;;
-    --exclude)    shift; [[ -n "$1" && "$1" != "--"* ]] && EXCLUDE_LIST="$1" ;;
+    --only=*)     ONLY_LIST="${1#*=}"
+                  [[ -n $ONLY_LIST ]] || { echo "Error: --only requires a value" >&2; exit 2; } ;;
+    --only)       [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --only requires a value" >&2; exit 2; }
+                  ONLY_LIST="$2"; shift ;;
+    --exclude=*)  EXCLUDE_LIST="${1#*=}"
+                  [[ -n $EXCLUDE_LIST ]] || { echo "Error: --exclude requires a value" >&2; exit 2; } ;;
+    --exclude)    [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --exclude requires a value" >&2; exit 2; }
+                  EXCLUDE_LIST="$2"; shift ;;
     --cron=*)
         echo "Error: --cron does not take a value with '='; use: hoist --cron <action>" >&2
         exit 2 ;;
@@ -285,10 +289,28 @@ _semver_satisfies() {
     esac
 }
 
+# _parse_to_epoch <iso_str>  -> echoes seconds-since-epoch, or returns 1.
+# Portable across GNU date (-d), Homebrew gdate, and BSD date (-j -f) for
+# common ISO formats.
+_parse_to_epoch() {
+    local input="$1" out
+    if out=$(date -d "$input" +%s 2>/dev/null); then echo "$out"; return 0; fi
+    if command -v gdate >/dev/null 2>&1 && out=$(gdate -d "$input" +%s 2>/dev/null); then
+        echo "$out"; return 0
+    fi
+    local fmt
+    for fmt in '%Y-%m-%dT%H:%M:%SZ' '%Y-%m-%dT%H:%M:%S' '%Y-%m-%d %H:%M:%S' '%Y-%m-%d'; do
+        if out=$(date -j -f "$fmt" "$input" +%s 2>/dev/null); then
+            echo "$out"; return 0
+        fi
+    done
+    return 1
+}
+
 # _check_pause_until <iso_str>  -> 0 if past the pause time (proceed), 1 if still paused
 _check_pause_until() {
     local target now
-    target=$(date -d "$1" +%s 2>/dev/null) || {
+    target=$(_parse_to_epoch "$1") || {
         log "Warning: pause_until value '$1' is not parseable; ignoring"
         return 0
     }
@@ -302,6 +324,14 @@ _check_pause_until() {
 _wait_for_healthy() {
     local container="$1" timeout="$2"
     local interval="${HEALTHCHECK_INTERVAL:-2}"
+    if ! [[ $timeout =~ ^[1-9][0-9]*$ ]]; then
+        log "$container: healthcheck timeout '$timeout' is not a positive integer; using default 120"
+        timeout=120
+    fi
+    if ! [[ $interval =~ ^[1-9][0-9]*$ ]]; then
+        log "Warning: HEALTHCHECK_INTERVAL '$interval' is not a positive integer; using default 2"
+        interval=2
+    fi
     local deadline=$(( $(date +%s) + timeout ))
     local status
     while (( $(date +%s) < deadline )); do
@@ -1497,6 +1527,8 @@ process_container() {
                     _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
                     : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
                 fi
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
                 return 1
             }
 
