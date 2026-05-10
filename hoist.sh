@@ -1581,6 +1581,9 @@ process_container() {
             log "$container_name: constraint '$hoist_constraint' violated by version '$new_oci_version' — blocking update"
             _constraint_blocked=true
             _tokens+=("constraint_blocked")
+            status="🔒 Update blocked by constraint ${hoist_constraint} (image=${new_oci_version})"
+            status_generic="update_blocked"
+            color=15105570
         fi
 
         # Group abort: if any peer in the same group already failed to pull, skip update
