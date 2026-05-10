@@ -1244,7 +1244,9 @@ send_telegram_notification() {
     local payload
     payload=$(jq -n --arg text "$text" --arg chat "$chat_id" \
         '{"chat_id":$chat,"text":$text,"disable_web_page_preview":true}')
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    # No -L: Telegram bot token is in the URL path; following a redirect
+    # to a different host would leak the token.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" \
         "https://api.telegram.org/bot${token}/sendMessage"
 }
@@ -1256,7 +1258,9 @@ send_gotify_notification() {
     local payload
     payload=$(jq -n --arg t "$title" --arg m "$message" \
         '{"title":$t,"message":$m,"priority":5}')
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    # No -L: Gotify URLs typically embed the token as ?token=...; a redirect
+    # to another host would leak it.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$url"
 }
 
@@ -1266,7 +1270,8 @@ send_ntfy_notification() {
     validate_webhook_url "$url" || return 1
     local -a hdrs=(-H "User-Agent: Hoist" -H "Title: $title" -H "Priority: default")
     [[ -n $token ]] && hdrs+=(-H "Authorization: Bearer $token")
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    # No -L: ntfy bearer token in Authorization header would leak on redirect.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         "${hdrs[@]}" -d "$message" "$url"
 }
 
@@ -1278,7 +1283,9 @@ send_teams_notification() {
     payload=$(jq -n --arg t "$title" --arg m "$message" \
         '{"@type":"MessageCard","@context":"https://schema.org/extensions",
           "summary":$t,"themeColor":"0076D7","title":$t,"text":$m}')
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    # No -L: Teams webhook URL is itself a credential; following redirects
+    # to a different host risks exposing it.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
 }
 
@@ -1291,7 +1298,8 @@ send_matrix_notification() {
     txn="hoist-$(date +%s%N)-$$"
     url="${homeserver%/}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn}"
     payload=$(jq -n --arg body "$message" '{"msgtype":"m.text","body":$body}')
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
+    # No -L: Matrix access token in Authorization header would leak on redirect.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
         -H "User-Agent: Hoist" -H "Authorization: Bearer ${token}" \
         -H "Content-Type: application/json" -d "$payload" "$url"
 }
@@ -1301,7 +1309,8 @@ _hc_ping() {
     [[ -n $HEALTHCHECKS_PING_URL ]] || return 0
     local suffix="${1:-}" url="${HEALTHCHECKS_PING_URL%/}"
     [[ -n $suffix ]] && url="${url}/${suffix}"
-    curl -fsSL --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
+    # No -L: the URL contains a check UUID that acts as a credential.
+    curl -fsS --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
 }
 
 # _skip_for_rollup <channel>  -> 0 if per-container send should be skipped
@@ -1367,7 +1376,8 @@ send_rollup_notifications() {
                 local payload
                 payload=$(jq -n --arg type "rollup" --arg ts "$(_iso_ts)" --arg msg "$message" \
                     '{"type":$type,"timestamp":$ts,"message":$msg}')
-                curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+                # No -L: generic webhook URL is itself a credential.
+                curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
                     -H "User-Agent: Hoist" -H "Content-Type: application/json" \
                     -d "$payload" "$GLOBAL_GENERIC_WEBHOOK" || true ;;
             telegram)
