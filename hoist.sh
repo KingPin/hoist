@@ -332,6 +332,15 @@ _wait_for_healthy() {
         log "Warning: HEALTHCHECK_INTERVAL '$interval' is not a positive integer; using default 2"
         interval=2
     fi
+    # Detect whether the image defines a HEALTHCHECK at all. Without one,
+    # this function can only wait for `running`/`exited` — not real health.
+    local has_health
+    has_health=$("${DOCKER_BINARY}" inspect --format \
+        '{{if .State.Health}}yes{{else}}no{{end}}' "$container" 2>/dev/null) || return 1
+    if [[ $has_health != yes ]]; then
+        log "$container: healthcheck.wait set but image defines no HEALTHCHECK — falling back to State.Status (running/exited only)"
+    fi
+
     local deadline=$(( $(date +%s) + timeout ))
     local status
     while (( $(date +%s) < deadline )); do
