@@ -31,6 +31,11 @@
 # Leave empty to run any time. --dry-run bypasses this check.
 # MAINTENANCE_WINDOW=02:00-06:00
 
+# Hostname shown in Discord embed footers ("Powered by Hoist • <hostname>"). Useful when
+# hoist runs on multiple hosts pointing at the same webhook. Leave empty to auto-detect
+# via `hostname -s`, $HOSTNAME, or /etc/hostname.
+# HOIST_HOSTNAME=docker-prod-01
+
 # Global fallback webhooks — used for any container that has update/notify enabled
 # but no per-container webhook label set. Per-container labels always take precedence.
 # GLOBAL_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...

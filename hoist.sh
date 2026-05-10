@@ -28,6 +28,7 @@ HEALTHCHECK_TIMEOUT=120
 HEALTHCHECK_INTERVAL=2
 ROLLBACK_DEFAULT="false"
 MAINTENANCE_WINDOW=""
+HOIST_HOSTNAME=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 UPDATE_CHECK="${UPDATE_CHECK:-notify}"
@@ -415,6 +416,20 @@ _iso_ts() {
     fi
 }
 
+_hoist_hostname() {
+    if [[ -n $HOIST_HOSTNAME ]]; then
+        printf '%s' "$HOIST_HOSTNAME"
+    elif command -v hostname >/dev/null 2>&1; then
+        hostname -s 2>/dev/null || hostname
+    elif [[ -n ${HOSTNAME:-} ]]; then
+        printf '%s' "$HOSTNAME"
+    elif [[ -r /etc/hostname ]]; then
+        tr -d '\n' < /etc/hostname
+    else
+        printf 'unknown'
+    fi
+}
+
 _self_update_notify() {
     local new_ver="$1" release_url="$2"
     local payload
@@ -423,10 +438,11 @@ _self_update_notify() {
             --arg title "Hoist update available: v${new_ver}" \
             --arg url "$release_url" \
             --arg cur "$HOIST_VERSION" \
+            --arg footer "Powered by Hoist • $(_hoist_hostname)" \
             '{"embeds":[{"title":$title,
                "description":("Current: v" + $cur + "\nRun `hoist --update` to upgrade"),
                "url":$url,"color":16776960,
-               "footer":{"text":"Powered by Hoist"}}],
+               "footer":{"text":$footer}}],
               "username":"Hoist"}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build Discord payload for self-update notify"
         }
@@ -1208,8 +1224,9 @@ send_discord_notification() {
         --argjson color "$color" \
         --argjson fields "$fields" \
         --arg ts "$(_iso_ts)" \
+        --arg footer "Powered by Hoist • $(_hoist_hostname)" \
         '{"embeds":[{"title":$title,"color":$color,"fields":$fields,
-            "footer":{"text":"Powered by Hoist"},"timestamp":$ts}],
+            "footer":{"text":$footer},"timestamp":$ts}],
           "username":"Hoist"}')
     validate_webhook_url "$webhook" || return 1
     curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
