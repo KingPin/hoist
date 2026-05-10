@@ -1383,6 +1383,8 @@ process_container() {
     local inspect
     inspect=$("${DOCKER_BINARY}" inspect "$container_name") || {
         log "$container_name: inspect failed"
+        _tokens+=("update_failed")
+        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
         return 1
     }
 
@@ -1431,7 +1433,12 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.wait"]    // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.timeout"] // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).rollback"]            // "")
-    ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
+    ' <<< "$inspect") || {
+        log "$container_name: failed to parse inspect output"
+        _tokens+=("update_failed")
+        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+        return 1
+    }
     readarray -t _vals <<< "$_jq_out"
 
     image_name="${_vals[0]}"
@@ -1539,7 +1546,12 @@ process_container() {
                 .Id,
                 (.Config.Labels["org.opencontainers.image.version"] // ""),
                 (.Config.Labels["org.opencontainers.image.revision"] // "")
-            ' <<< "$image_inspect") || { log "$container_name: failed to parse image inspect output"; return 1; }
+            ' <<< "$image_inspect") || {
+                log "$container_name: failed to parse image inspect output"
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+                return 1
+            }
             readarray -t _img <<< "$_img_out"
             image_digest="${_img[0]}"
             new_oci_version="${_img[1]}"
