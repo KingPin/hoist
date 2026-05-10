@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.3.0"
+HOIST_VERSION="1.4.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
