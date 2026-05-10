@@ -48,9 +48,20 @@ All behavior is controlled by Docker labels on containers:
 | `com.sumguy.hoist[.TAG].discord.webhook` | Discord embed webhook URL |
 | `com.sumguy.hoist[.TAG].generic.webhook` | Generic JSON webhook URL |
 | `com.sumguy.hoist[.TAG].slack.webhook` | Slack incoming webhook URL |
+| `com.sumguy.hoist[.TAG].telegram.bot_token` / `.telegram.chat_id` | Telegram bot credentials |
+| `com.sumguy.hoist[.TAG].gotify.url` | Gotify message URL (token in query string) |
+| `com.sumguy.hoist[.TAG].ntfy.url` / `.ntfy.token` | ntfy.sh topic URL + optional bearer token |
+| `com.sumguy.hoist[.TAG].teams.webhook` | Microsoft Teams incoming webhook |
+| `com.sumguy.hoist[.TAG].matrix.homeserver` / `.matrix.room_id` / `.matrix.token` | Matrix room credentials |
 | `com.sumguy.hoist[.TAG].script.update` | Shell command run before container recreate |
 | `com.sumguy.hoist[.TAG].script.notify` | Shell command run before webhook notification |
 | `com.sumguy.hoist[.TAG].registry.authfile` | JSON file with `username`, `password`, `registry` |
+| `com.sumguy.hoist[.TAG].pause_until` | ISO date/datetime; skip container until current time ≥ value (token: `paused`). Unparseable = fail-open with warning |
+| `com.sumguy.hoist[.TAG].constraint` | Semver pin (`^`, `~`, `>=`, `<=`, `>`, `<`, `=`, exact) checked against new image's `org.opencontainers.image.version`. Violation = skip update + notify (token: `constraint_blocked`). Missing version label = fail-open. **Caret on 0.x.y differs from npm**: hoist's `^0.1.2` allows any `0.x` ≥ `0.1.2`; npm's restricts to `0.1.z`. Use `~0.1.2` (or `>=0.1.2,<0.2`) for npm-style behavior |
+| `com.sumguy.hoist[.TAG].group` | Free-form group name. Any member's pull failure writes `${CACHE_LOCATION}/hoist-group-<group>.failed` and aborts updates for the rest (token: `group_aborted`). Soft atomicity under `--parallel`: a sibling may finish before its peer fails |
+| `com.sumguy.hoist[.TAG].healthcheck.wait` | `true` to poll `docker inspect .State.Health.Status` after `compose up`. On `unhealthy`/`exited`/timeout: emits `unhealthy` token and triggers rollback if enabled. **Caveat:** if the image defines no `HEALTHCHECK`, this falls back to `.State.Status` — only `running` vs `exited` are observable, not real health. A warning is logged in that case |
+| `com.sumguy.hoist[.TAG].healthcheck.timeout` | Per-container override of `HEALTHCHECK_TIMEOUT` (seconds). Polls every `HEALTHCHECK_INTERVAL` seconds (default 2) |
+| `com.sumguy.hoist[.TAG].rollback` | `true` re-aliases the prior image SHA back onto the original tag and re-runs `compose up --no-pull` on update failure or unhealthy. Old SHA must still be present locally — `PRUNE_IMAGES=true` may remove it (token: `rollback_failed`). Tokens: `rolled_back`, `rollback_failed`. Default from config `ROLLBACK_DEFAULT` (default `false`) |
 
 A container can have both `update` and `notify` set — it will update AND send notifications.
 
@@ -60,7 +71,7 @@ Notification state is persisted in `${CACHE_LOCATION}/hoist-<safe-name>.notified
 
 ### Run summary
 
-Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files are wiped at the start of each run.
+Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`, `paused`, `constraint_blocked`, `group_aborted`, `unhealthy`, `rolled_back`, `rollback_failed`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files (and `hoist-group-*.failed` flags) are wiped at the start of each run. The end-of-run Healthchecks.io ping is `/fail` if any container produced `update_failed`, `unhealthy`, or `rollback_failed`; otherwise success.
 
 ### Self-update
 
@@ -103,6 +114,12 @@ Privilege handling lives in `_sudo_if_needed` (`hoist.sh:461-475`): walks up to 
 
 A worked Ansible playbook that drives `--cron install` through this contract lives in `examples/ansible/`.
 
-### Parallel mode caveat
+### Parallel mode
 
-When `--parallel N` (N > 1) is used, functions and variables are exported via `export -f` so subshells spawned by `xargs` can access them. The canonical export list lives in `setup_environment` (hoist.sh) — any new helper function called from `process_container` (or its callees) must be added there, or it will silently break in parallel mode while still working serially.
+`--parallel N` uses a bash worker pool (`process_container "$c" &` + `wait -n`) inside the same shell process. Forked subshells inherit functions and variables natively, so no `export -f` is needed — new helpers Just Work. Bash 4.3+ is required for `wait -n`. Per-container state goes through cache files (`.notified`, `.run-result`, `.rollup`) since variables modified in a `&` subshell don't propagate back to the parent.
+
+### Notification channels and rollup
+
+Per-container labels: discord, slack, generic, telegram, gotify, ntfy, teams, matrix. Each channel also has a `GLOBAL_*` fallback in config. When `WEBHOOK_ROLLUP=true`, channels listed in `WEBHOOK_ROLLUP_CHANNELS` get one summary message at end of run (using the `GLOBAL_*` URL) instead of per-container sends — per-container labels for those channels are ignored.
+
+`HEALTHCHECKS_PING_URL` triggers a `/start` ping at run start, the bare URL on success at run end, or `/fail` if any container's update failed. Best-effort.

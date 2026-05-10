@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.3.0"
+HOIST_VERSION="1.4.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -12,6 +12,21 @@ LOG_FILE=""
 GLOBAL_DISCORD_WEBHOOK=""
 GLOBAL_SLACK_WEBHOOK=""
 GLOBAL_GENERIC_WEBHOOK=""
+GLOBAL_TELEGRAM_BOT_TOKEN=""
+GLOBAL_TELEGRAM_CHAT_ID=""
+GLOBAL_GOTIFY_URL=""
+GLOBAL_NTFY_URL=""
+GLOBAL_NTFY_TOKEN=""
+GLOBAL_TEAMS_WEBHOOK=""
+GLOBAL_MATRIX_HOMESERVER=""
+GLOBAL_MATRIX_ROOM_ID=""
+GLOBAL_MATRIX_TOKEN=""
+HEALTHCHECKS_PING_URL=""
+WEBHOOK_ROLLUP="false"
+WEBHOOK_ROLLUP_CHANNELS="discord,slack,generic"
+HEALTHCHECK_TIMEOUT=120
+HEALTHCHECK_INTERVAL=2
+ROLLBACK_DEFAULT="false"
 MAINTENANCE_WINDOW=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
@@ -24,6 +39,8 @@ CRON_ACTION=""
 CRON_SCHEDULE_FLAG=""
 CRON_USER_FLAG=""
 CRON_BACKEND_FLAG=""
+ONLY_LIST=""
+EXCLUDE_LIST=""
 
 log() {
     local msg="[$(date +%T)] $*"
@@ -53,6 +70,14 @@ while [[ "$1" != "" ]]; do
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
     --list|--status) DO_LIST=true ;;
+    --only=*)     ONLY_LIST="${1#*=}"
+                  [[ -n $ONLY_LIST ]] || { echo "Error: --only requires a value" >&2; exit 2; } ;;
+    --only)       [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --only requires a value" >&2; exit 2; }
+                  ONLY_LIST="$2"; shift ;;
+    --exclude=*)  EXCLUDE_LIST="${1#*=}"
+                  [[ -n $EXCLUDE_LIST ]] || { echo "Error: --exclude requires a value" >&2; exit 2; } ;;
+    --exclude)    [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --exclude requires a value" >&2; exit 2; }
+                  EXCLUDE_LIST="$2"; shift ;;
     --cron=*)
         echo "Error: --cron does not take a value with '='; use: hoist --cron <action>" >&2
         exit 2 ;;
@@ -89,6 +114,8 @@ Options:
   --parallel <N>     Process containers concurrently with N workers
   --list, --status   Print a table of running containers and their label
                      config, then exit (no pulls or updates)
+  --only <names>     Comma-separated container names to include (others skipped)
+  --exclude <names>  Comma-separated container names to exclude
   --update           Self-update hoist to the latest GitHub release
   --force            With --update, reinstall even if already up to date
   --version          Print version and exit
@@ -117,21 +144,28 @@ EOF
     shift
 done
 
-# Bash 4+ check runs after arg parse so --version/--help still work on macOS
+# Bash 4.3+ check runs after arg parse so --version/--help still work on macOS
 # system bash 3.2 — users need a way to diagnose what they have installed.
-if [[ -z ${BASH_VERSINFO+x} || ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    echo "Error: hoist requires bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+# 4.3 is required for `wait -n` used by the parallel worker pool.
+if [[ -z ${BASH_VERSINFO+x} ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
+    echo "Error: hoist requires bash 4.3+ (current: ${BASH_VERSION:-unknown})." >&2
     echo "  macOS: brew install bash, then ensure the Homebrew bash is first in PATH" >&2
     echo "         (e.g. /opt/homebrew/bin or /usr/local/bin), or invoke hoist with that bash explicitly." >&2
     echo "  Verify with: bash --version" >&2
     exit 1
 fi
 
+# Tear down only the background workers we spawned, not the entire process
+# group — `kill 0` would also signal shell siblings (e.g. the cron parent).
+trap '_jobs=$(jobs -p); [[ -n "$_jobs" ]] && kill $_jobs 2>/dev/null; exit 130' INT TERM
+
 if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
 fi
 
-for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK; do
+for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK \
+               GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_TEAMS_WEBHOOK \
+               GLOBAL_MATRIX_HOMESERVER HEALTHCHECKS_PING_URL; do
     _wh_val="${!_wh_var}"
     if [[ -n "$_wh_val" ]]; then
         [[ "$_wh_val" =~ ^https?:// ]] || { echo "Error: $_wh_var is not a valid http(s) URL: $_wh_val"; exit 1; }
@@ -141,15 +175,17 @@ done
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 
 setup_environment() {
+    # Exported so external child processes (user script.update / script.notify hooks,
+    # docker, curl) see them. Bash functions are inherited automatically by `&`-spawned
+    # subshells in the same process, so no `export -f` is needed for the parallel pool.
     export DOCKER_BINARY CACHE_LOCATION TAG DRY_RUN VERBOSE CURL_TIMEOUT
     export PRUNE_IMAGES LOG_FILE MAINTENANCE_WINDOW
     export GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK
-    if [[ $PARALLEL -gt 1 ]]; then
-        export -f process_container compose_pull_wrapper compose_up_wrapper log
-        export -f send_discord_notification send_generic_webhook send_slack_notification
-        export -f check_maintenance_window validate_webhook_url validate_script_path
-        export -f _semver_gt _self_update_notify _self_update_apply _self_update_check _sha256 _iso_ts
-    fi
+    export GLOBAL_TELEGRAM_BOT_TOKEN GLOBAL_TELEGRAM_CHAT_ID
+    export GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_NTFY_TOKEN GLOBAL_TEAMS_WEBHOOK
+    export GLOBAL_MATRIX_HOMESERVER GLOBAL_MATRIX_ROOM_ID GLOBAL_MATRIX_TOKEN
+    export HEALTHCHECKS_PING_URL WEBHOOK_ROLLUP WEBHOOK_ROLLUP_CHANNELS
+    export HEALTHCHECK_TIMEOUT HEALTHCHECK_INTERVAL ROLLBACK_DEFAULT
 }
 
 check_maintenance_window() {
@@ -210,6 +246,149 @@ _semver_gt() {
         [[ $av -lt $bv ]] && return 1
     done
     return 1
+}
+
+# 0 if a == b, ignoring pre-release suffixes
+_semver_eq() {
+    local IFS=.
+    local -a a=($1) b=($2)
+    for i in 0 1 2; do
+        local av=${a[i]:-0} bv=${b[i]:-0}
+        av=${av%%[!0-9]*}; bv=${bv%%[!0-9]*}
+        [[ $av != "$bv" ]] && return 1
+    done
+    return 0
+}
+
+# _semver_satisfies <constraint> <version>  -> 0 if version satisfies constraint
+# Supports: ^X.Y.Z (same major), ~X.Y.Z (same major+minor), >=X, <=X, >X, <X, =X, X (exact)
+_semver_satisfies() {
+    local constraint="$1" version="$2"
+    [[ -z $version ]] && return 0   # no version label = can't enforce, fail-open
+    local op base
+    case "$constraint" in
+        ^*)  op="^"; base="${constraint#^}" ;;
+        ~*)  op="~"; base="${constraint#~}" ;;
+        ">="*) op=">="; base="${constraint#>=}" ;;
+        "<="*) op="<="; base="${constraint#<=}" ;;
+        ">"*)  op=">";  base="${constraint#>}" ;;
+        "<"*)  op="<";  base="${constraint#<}" ;;
+        "="*)  op="=";  base="${constraint#=}" ;;
+        *)     op="=";  base="$constraint" ;;
+    esac
+    local IFS=.
+    local -a c=($base) v=($version)
+    case "$op" in
+        ^)  [[ ${v[0]:-0} == "${c[0]:-0}" ]] || return 1
+            _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        ~)  [[ ${v[0]:-0} == "${c[0]:-0}" && ${v[1]:-0} == "${c[1]:-0}" ]] || return 1
+            _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        ">=") _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
+        "<=") ! _semver_gt "$version" "$base" ;;
+        ">")  _semver_gt "$version" "$base" ;;
+        "<")  _semver_gt "$base" "$version" ;;
+        "=")  _semver_eq "$version" "$base" ;;
+    esac
+}
+
+# _parse_to_epoch <iso_str>  -> echoes seconds-since-epoch, or returns 1.
+# Portable across GNU date (-d), Homebrew gdate, and BSD date (-j -f) for
+# common ISO formats.
+_parse_to_epoch() {
+    local input="$1" out
+    if out=$(date -d "$input" +%s 2>/dev/null); then echo "$out"; return 0; fi
+    if command -v gdate >/dev/null 2>&1 && out=$(gdate -d "$input" +%s 2>/dev/null); then
+        echo "$out"; return 0
+    fi
+    local fmt
+    for fmt in '%Y-%m-%dT%H:%M:%SZ' '%Y-%m-%dT%H:%M:%S' '%Y-%m-%d %H:%M:%S' '%Y-%m-%d'; do
+        if out=$(date -j -f "$fmt" "$input" +%s 2>/dev/null); then
+            echo "$out"; return 0
+        fi
+    done
+    return 1
+}
+
+# _check_pause_until <iso_str>  -> 0 if past the pause time (proceed), 1 if still paused
+_check_pause_until() {
+    local target now
+    target=$(_parse_to_epoch "$1") || {
+        log "Warning: pause_until value '$1' is not parseable; ignoring"
+        return 0
+    }
+    now=$(date +%s)
+    (( now >= target ))
+}
+
+# _wait_for_healthy <container> <timeout_seconds>
+#   0 = container reached healthy / running
+#   1 = unhealthy, exited, or timed out
+_wait_for_healthy() {
+    local container="$1" timeout="$2"
+    local interval="${HEALTHCHECK_INTERVAL:-2}"
+    if ! [[ $timeout =~ ^[1-9][0-9]*$ ]]; then
+        log "$container: healthcheck timeout '$timeout' is not a positive integer; using default 120"
+        timeout=120
+    fi
+    if ! [[ $interval =~ ^[1-9][0-9]*$ ]]; then
+        log "Warning: HEALTHCHECK_INTERVAL '$interval' is not a positive integer; using default 2"
+        interval=2
+    fi
+    # Detect whether the image defines a HEALTHCHECK at all. Without one,
+    # this function can only wait for `running`/`exited` — not real health.
+    local has_health
+    has_health=$("${DOCKER_BINARY}" inspect --format \
+        '{{if .State.Health}}yes{{else}}no{{end}}' "$container" 2>/dev/null) || return 1
+    if [[ $has_health != yes ]]; then
+        log "$container: healthcheck.wait set but image defines no HEALTHCHECK — falling back to State.Status (running/exited only)"
+    fi
+
+    local deadline=$(( $(date +%s) + timeout ))
+    local status
+    while (( $(date +%s) < deadline )); do
+        status=$("${DOCKER_BINARY}" inspect --format \
+            '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+            "$container" 2>/dev/null) || return 1
+        case "$status" in
+            healthy|running) return 0 ;;
+            unhealthy|exited|dead) return 1 ;;
+            starting|created|restarting|paused) ;;
+            *) ;;
+        esac
+        sleep "$interval"
+    done
+    return 1
+}
+
+# _rollback_container <container> <workdir> <service> <image_name> <old_image_sha>
+#   Re-aliases the previous image SHA back onto the original tag and re-runs compose up.
+#   Requires the old image to still be present locally (PRUNE_IMAGES may have removed it).
+_rollback_container() {
+    local container="$1" workdir="$2" service="$3" image_name="$4" old_sha="$5"
+    if [[ -z "$old_sha" ]]; then
+        log "$container: rollback skipped — old image SHA unknown"
+        return 1
+    fi
+    if ! "${DOCKER_BINARY}" image inspect "$old_sha" >/dev/null 2>&1; then
+        log "$container: rollback failed — old image $old_sha no longer present locally (was it pruned?)"
+        return 1
+    fi
+    log "$container: rolling back to $old_sha"
+    if ! "${DOCKER_BINARY}" tag "$old_sha" "$image_name"; then
+        log "$container: rollback failed — could not re-tag $old_sha as $image_name"
+        return 1
+    fi
+    if [[ ! -d $workdir ]]; then
+        log "$container: rollback failed — compose workdir '$workdir' is missing"
+        return 1
+    fi
+    # Re-run compose up without pulling — picks up the now-aliased image.
+    if ! ( cd "$workdir" && "${DOCKER_BINARY}" compose up -d --no-pull "$service" ) >/dev/null 2>&1; then
+        log "$container: rollback failed — compose up did not succeed"
+        return 1
+    fi
+    log "$container: rollback complete"
+    return 0
 }
 
 _sha256() {
@@ -1064,6 +1243,174 @@ send_slack_notification() {
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
 }
 
+# send_telegram_notification <text> <bot_token> <chat_id>
+send_telegram_notification() {
+    local text="$1" token="$2" chat_id="$3"
+    [[ -n $token && -n $chat_id ]] || { log "Telegram: missing bot_token or chat_id"; return 1; }
+    local payload
+    payload=$(jq -n --arg text "$text" --arg chat "$chat_id" \
+        '{"chat_id":$chat,"text":$text,"disable_web_page_preview":true}')
+    # No -L: Telegram bot token is in the URL path; following a redirect
+    # to a different host would leak the token.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" \
+        "https://api.telegram.org/bot${token}/sendMessage"
+}
+
+# send_gotify_notification <title> <message> <url>  (url may include ?token=...)
+send_gotify_notification() {
+    local title="$1" message="$2" url="$3"
+    validate_webhook_url "$url" || return 1
+    local payload
+    payload=$(jq -n --arg t "$title" --arg m "$message" \
+        '{"title":$t,"message":$m,"priority":5}')
+    # No -L: Gotify URLs typically embed the token as ?token=...; a redirect
+    # to another host would leak it.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$url"
+}
+
+# send_ntfy_notification <title> <message> <url> [token]
+send_ntfy_notification() {
+    local title="$1" message="$2" url="$3" token="${4:-}"
+    validate_webhook_url "$url" || return 1
+    local -a hdrs=(-H "User-Agent: Hoist" -H "Title: $title" -H "Priority: default")
+    [[ -n $token ]] && hdrs+=(-H "Authorization: Bearer $token")
+    # No -L: ntfy bearer token in Authorization header would leak on redirect.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        "${hdrs[@]}" -d "$message" "$url"
+}
+
+# send_teams_notification <title> <message> <webhook>
+send_teams_notification() {
+    local title="$1" message="$2" webhook="$3"
+    validate_webhook_url "$webhook" || return 1
+    local payload
+    payload=$(jq -n --arg t "$title" --arg m "$message" \
+        '{"@type":"MessageCard","@context":"https://schema.org/extensions",
+          "summary":$t,"themeColor":"0076D7","title":$t,"text":$m}')
+    # No -L: Teams webhook URL is itself a credential; following redirects
+    # to a different host risks exposing it.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
+}
+
+# send_matrix_notification <message> <homeserver> <room_id> <access_token>
+send_matrix_notification() {
+    local message="$1" homeserver="$2" room_id="$3" token="$4"
+    [[ -n $homeserver && -n $room_id && -n $token ]] || { log "Matrix: missing homeserver/room_id/token"; return 1; }
+    validate_webhook_url "$homeserver" || return 1
+    local txn url payload
+    txn="hoist-$(date +%s%N)-$$"
+    url="${homeserver%/}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn}"
+    payload=$(jq -n --arg body "$message" '{"msgtype":"m.text","body":$body}')
+    # No -L: Matrix access token in Authorization header would leak on redirect.
+    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
+        -H "User-Agent: Hoist" -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" -d "$payload" "$url"
+}
+
+# _hc_ping [start|fail|""]  (suffix optional; empty = success)
+_hc_ping() {
+    [[ -n $HEALTHCHECKS_PING_URL ]] || return 0
+    local suffix="${1:-}" url="${HEALTHCHECKS_PING_URL%/}"
+    [[ -n $suffix ]] && url="${url}/${suffix}"
+    # No -L: the URL contains a check UUID that acts as a credential.
+    curl -fsS --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
+}
+
+# _skip_for_rollup <channel>  -> 0 if per-container send should be skipped
+# (rollup will handle it). Falls back to per-container send when rollup is
+# enabled but the channel's GLOBAL_* fallback is unset, so users with only
+# per-container labels still get notifications.
+_skip_for_rollup() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 1
+    [[ ",${WEBHOOK_ROLLUP_CHANNELS}," == *",$1,"* ]] || return 1
+    case "$1" in
+        discord)  [[ -n $GLOBAL_DISCORD_WEBHOOK ]] ;;
+        slack)    [[ -n $GLOBAL_SLACK_WEBHOOK ]] ;;
+        generic)  [[ -n $GLOBAL_GENERIC_WEBHOOK ]] ;;
+        telegram) [[ -n $GLOBAL_TELEGRAM_BOT_TOKEN && -n $GLOBAL_TELEGRAM_CHAT_ID ]] ;;
+        gotify)   [[ -n $GLOBAL_GOTIFY_URL ]] ;;
+        ntfy)     [[ -n $GLOBAL_NTFY_URL ]] ;;
+        teams)    [[ -n $GLOBAL_TEAMS_WEBHOOK ]] ;;
+        matrix)   [[ -n $GLOBAL_MATRIX_HOMESERVER && -n $GLOBAL_MATRIX_ROOM_ID && -n $GLOBAL_MATRIX_TOKEN ]] ;;
+        *)        return 1 ;;
+    esac
+}
+
+# write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
+write_rollup_entry() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 0
+    local safe
+    safe=$(printf '%s' "$2" | tr -cs '[:alnum:]._-' '_')
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" \
+        > "${CACHE_LOCATION}/hoist-${safe}.rollup"
+}
+
+# Aggregate all .rollup files into a single multi-line summary, send to each rollup channel
+send_rollup_notifications() {
+    [[ $WEBHOOK_ROLLUP == true ]] || return 0
+    local f lines=""
+    for f in "${CACHE_LOCATION}"/hoist-*.rollup; do
+        [[ -f $f ]] || continue
+        local status container image old new
+        IFS=$'\t' read -r status container image old new < "$f"
+        local short_old="${old:0:11}" short_new="${new:0:11}"
+        lines+="• [${status}] ${container} (${image}) ${short_old} → ${short_new}"$'\n'
+    done
+    [[ -z $lines ]] && return 0
+    local title="Hoist run summary"
+    local message="${title}"$'\n'"${lines%$'\n'}"
+
+    local ch
+    IFS=',' read -ra _rollup_channels <<< "$WEBHOOK_ROLLUP_CHANNELS"
+    for ch in "${_rollup_channels[@]}"; do
+        case "$ch" in
+            discord)
+                [[ -n $GLOBAL_DISCORD_WEBHOOK ]] || continue
+                log "Rollup: sending Discord summary..."
+                send_discord_notification "$title" "rollup" "" "" "$message" \
+                    "$GLOBAL_DISCORD_WEBHOOK" "" "" "" "" 768753 || true ;;
+            slack)
+                [[ -n $GLOBAL_SLACK_WEBHOOK ]] || continue
+                log "Rollup: sending Slack summary..."
+                send_slack_notification "$message" "$GLOBAL_SLACK_WEBHOOK" || true ;;
+            generic)
+                [[ -n $GLOBAL_GENERIC_WEBHOOK ]] || continue
+                log "Rollup: sending generic webhook summary..."
+                local payload
+                payload=$(jq -n --arg type "rollup" --arg ts "$(_iso_ts)" --arg msg "$message" \
+                    '{"type":$type,"timestamp":$ts,"message":$msg}')
+                # No -L: generic webhook URL is itself a credential.
+                curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+                    -H "User-Agent: Hoist" -H "Content-Type: application/json" \
+                    -d "$payload" "$GLOBAL_GENERIC_WEBHOOK" || true ;;
+            telegram)
+                [[ -n $GLOBAL_TELEGRAM_BOT_TOKEN && -n $GLOBAL_TELEGRAM_CHAT_ID ]] || continue
+                log "Rollup: sending Telegram summary..."
+                send_telegram_notification "$message" "$GLOBAL_TELEGRAM_BOT_TOKEN" "$GLOBAL_TELEGRAM_CHAT_ID" || true ;;
+            gotify)
+                [[ -n $GLOBAL_GOTIFY_URL ]] || continue
+                log "Rollup: sending Gotify summary..."
+                send_gotify_notification "$title" "$message" "$GLOBAL_GOTIFY_URL" || true ;;
+            ntfy)
+                [[ -n $GLOBAL_NTFY_URL ]] || continue
+                log "Rollup: sending ntfy summary..."
+                send_ntfy_notification "$title" "$message" "$GLOBAL_NTFY_URL" "$GLOBAL_NTFY_TOKEN" || true ;;
+            teams)
+                [[ -n $GLOBAL_TEAMS_WEBHOOK ]] || continue
+                log "Rollup: sending Teams summary..."
+                send_teams_notification "$title" "$message" "$GLOBAL_TEAMS_WEBHOOK" || true ;;
+            matrix)
+                [[ -n $GLOBAL_MATRIX_HOMESERVER && -n $GLOBAL_MATRIX_ROOM_ID && -n $GLOBAL_MATRIX_TOKEN ]] || continue
+                log "Rollup: sending Matrix summary..."
+                send_matrix_notification "$message" "$GLOBAL_MATRIX_HOMESERVER" \
+                    "$GLOBAL_MATRIX_ROOM_ID" "$GLOBAL_MATRIX_TOKEN" || true ;;
+        esac
+    done
+}
+
 process_container() {
     local container_name="$1"
     local safe_name
@@ -1075,6 +1422,8 @@ process_container() {
     local inspect
     inspect=$("${DOCKER_BINARY}" inspect "$container_name") || {
         log "$container_name: inspect failed"
+        _tokens+=("update_failed")
+        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
         return 1
     }
 
@@ -1082,6 +1431,11 @@ process_container() {
     local docker_compose_service docker_compose_version docker_compose_workdir
     local old_oci_version old_oci_revision
     local hoist_update hoist_notify hoist_discord_webhook hoist_generic_webhook hoist_slack_webhook
+    local hoist_telegram_bot_token hoist_telegram_chat_id
+    local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
+    local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
+    local hoist_pause_until hoist_constraint hoist_group
+    local hoist_healthcheck_wait hoist_healthcheck_timeout hoist_rollback
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
@@ -1102,8 +1456,28 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).slack.webhook"]     // .Config.Labels["org.hotio.pullio\($tag).slack.webhook"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).script.update"]     // .Config.Labels["org.hotio.pullio\($tag).script.update"]     // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).script.notify"]     // .Config.Labels["org.hotio.pullio\($tag).script.notify"]     // ""),
-        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // "")
-    ' <<< "$inspect") || { log "$container_name: failed to parse inspect output"; return 1; }
+        (.Config.Labels["com.sumguy.hoist\($tag).registry.authfile"] // .Config.Labels["org.hotio.pullio\($tag).registry.authfile"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).telegram.bot_token"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).telegram.chat_id"]   // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).gotify.url"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).ntfy.url"]           // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).ntfy.token"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).teams.webhook"]      // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.homeserver"]  // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.room_id"]     // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).matrix.token"]       // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).pause_until"]        // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).constraint"]         // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).group"]              // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.wait"]    // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.timeout"] // ""),
+        (.Config.Labels["com.sumguy.hoist\($tag).rollback"]            // "")
+    ' <<< "$inspect") || {
+        log "$container_name: failed to parse inspect output"
+        _tokens+=("update_failed")
+        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+        return 1
+    }
     readarray -t _vals <<< "$_jq_out"
 
     image_name="${_vals[0]}"
@@ -1118,12 +1492,37 @@ process_container() {
     hoist_discord_webhook="${_vals[9]}"
     hoist_generic_webhook="${_vals[10]}"
     hoist_slack_webhook="${_vals[11]}"
-    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
-    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
-    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
     read -ra hoist_script_update <<< "${_vals[12]}"
     read -ra hoist_script_notify <<< "${_vals[13]}"
     hoist_registry_authfile="${_vals[14]}"
+    hoist_telegram_bot_token="${_vals[15]}"
+    hoist_telegram_chat_id="${_vals[16]}"
+    hoist_gotify_url="${_vals[17]}"
+    hoist_ntfy_url="${_vals[18]}"
+    hoist_ntfy_token="${_vals[19]}"
+    hoist_teams_webhook="${_vals[20]}"
+    hoist_matrix_homeserver="${_vals[21]}"
+    hoist_matrix_room_id="${_vals[22]}"
+    hoist_matrix_token="${_vals[23]}"
+    hoist_pause_until="${_vals[24]}"
+    hoist_constraint="${_vals[25]}"
+    hoist_group="${_vals[26]}"
+    hoist_healthcheck_wait="${_vals[27]}"
+    hoist_healthcheck_timeout="${_vals[28]}"
+    hoist_rollback="${_vals[29]}"
+
+    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
+    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
+    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
+    local effective_telegram_bot_token="${hoist_telegram_bot_token:-$GLOBAL_TELEGRAM_BOT_TOKEN}"
+    local effective_telegram_chat_id="${hoist_telegram_chat_id:-$GLOBAL_TELEGRAM_CHAT_ID}"
+    local effective_gotify_url="${hoist_gotify_url:-$GLOBAL_GOTIFY_URL}"
+    local effective_ntfy_url="${hoist_ntfy_url:-$GLOBAL_NTFY_URL}"
+    local effective_ntfy_token="${hoist_ntfy_token:-$GLOBAL_NTFY_TOKEN}"
+    local effective_teams_webhook="${hoist_teams_webhook:-$GLOBAL_TEAMS_WEBHOOK}"
+    local effective_matrix_homeserver="${hoist_matrix_homeserver:-$GLOBAL_MATRIX_HOMESERVER}"
+    local effective_matrix_room_id="${hoist_matrix_room_id:-$GLOBAL_MATRIX_ROOM_ID}"
+    local effective_matrix_token="${hoist_matrix_token:-$GLOBAL_MATRIX_TOKEN}"
     if [[ -n "${hoist_script_update[0]}" ]]; then
         validate_script_path "${hoist_script_update[0]}" || {
             log "$container_name: script.update label rejected; skipping"
@@ -1138,6 +1537,12 @@ process_container() {
     fi
 
     if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
+        if [[ -n $hoist_pause_until ]] && ! _check_pause_until "$hoist_pause_until"; then
+            log "$container_name: paused until $hoist_pause_until"
+            _tokens+=("paused")
+            printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+            return 0
+        fi
         if [[ -n "$hoist_registry_authfile" ]]; then
             if [[ "$hoist_registry_authfile" != /* ]]; then
                 log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
@@ -1163,6 +1568,13 @@ process_container() {
             log "$container_name: Pulling image..."
             compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
                 log "$container_name: Pull failed"
+                if [[ -n $hoist_group ]]; then
+                    local _g_safe
+                    _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+                    : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
+                fi
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
                 return 1
             }
 
@@ -1173,7 +1585,12 @@ process_container() {
                 .Id,
                 (.Config.Labels["org.opencontainers.image.version"] // ""),
                 (.Config.Labels["org.opencontainers.image.revision"] // "")
-            ' <<< "$image_inspect") || { log "$container_name: failed to parse image inspect output"; return 1; }
+            ' <<< "$image_inspect") || {
+                log "$container_name: failed to parse image inspect output"
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+                return 1
+            }
             readarray -t _img <<< "$_img_out"
             image_digest="${_img[0]}"
             new_oci_version="${_img[1]}"
@@ -1182,7 +1599,32 @@ process_container() {
 
         local status="🔄 Update available" status_generic="update_available" color=768753
 
-        if [[ $image_digest != "$container_image_digest" && $hoist_update == true ]]; then
+        # Constraint check: if violated, block update but still allow notify
+        local _constraint_blocked=false
+        if [[ -n $hoist_constraint && -n $new_oci_version ]] \
+           && ! _semver_satisfies "$hoist_constraint" "$new_oci_version"; then
+            log "$container_name: constraint '$hoist_constraint' violated by version '$new_oci_version' — blocking update"
+            _constraint_blocked=true
+            _tokens+=("constraint_blocked")
+            status="🔒 Update blocked by constraint ${hoist_constraint} (image=${new_oci_version})"
+            status_generic="update_blocked"
+            color=15105570
+        fi
+
+        # Group abort: if any peer in the same group already failed to pull, skip update
+        local _group_aborted=false
+        if [[ -n $hoist_group ]]; then
+            local _g_safe
+            _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+            if [[ -f "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" ]]; then
+                log "$container_name: group '$hoist_group' has a failed peer — aborting update"
+                _group_aborted=true
+                _tokens+=("group_aborted")
+            fi
+        fi
+
+        if [[ $image_digest != "$container_image_digest" && $hoist_update == true \
+              && $_constraint_blocked != true && $_group_aborted != true ]]; then
             if [[ $DRY_RUN == true ]]; then
                 log "$container_name: [dry-run] would update container"
             else
@@ -1203,17 +1645,49 @@ process_container() {
                     "${hoist_script_update[@]}"
                 fi
                 log "$container_name: Updating container..."
+                local _rollback_enabled=false
+                if [[ $hoist_rollback == true ]] || [[ -z $hoist_rollback && $ROLLBACK_DEFAULT == true ]]; then
+                    _rollback_enabled=true
+                fi
+                local _hc_timeout="${hoist_healthcheck_timeout:-$HEALTHCHECK_TIMEOUT}"
+                local _update_ok=false _hc_ok=true
                 if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
+                    _update_ok=true
+                    if [[ $hoist_healthcheck_wait == true ]]; then
+                        log "$container_name: Waiting up to ${_hc_timeout}s for healthy..."
+                        if ! _wait_for_healthy "$container_name" "$_hc_timeout"; then
+                            _hc_ok=false
+                            log "$container_name: container failed healthcheck after update"
+                        fi
+                    fi
+                fi
+
+                if [[ $_update_ok == true && $_hc_ok == true ]]; then
                     status="✅ Update succeeded"
                     status_generic="update_success"
                     color=3066993
                     _tokens+=("updated")
                 else
-                    log "$container_name: Update failed"
-                    status="❌ Update failed"
-                    status_generic="update_failure"
+                    if [[ $_update_ok == true && $_hc_ok != true ]]; then
+                        status="❌ Update unhealthy"
+                        status_generic="update_failure"
+                        _tokens+=("unhealthy")
+                    else
+                        log "$container_name: Update failed"
+                        status="❌ Update failed"
+                        status_generic="update_failure"
+                        _tokens+=("update_failed")
+                    fi
                     color=15158332
-                    _tokens+=("update_failed")
+                    if [[ $_rollback_enabled == true ]]; then
+                        if _rollback_container "$container_name" "$docker_compose_workdir" "$docker_compose_service" "$image_name" "$container_image_digest"; then
+                            _tokens+=("rolled_back")
+                            status+=" (rolled back)"
+                        else
+                            _tokens+=("rollback_failed")
+                            status+=" (rollback failed)"
+                        fi
+                    fi
                 fi
                 rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
             fi
@@ -1237,24 +1711,48 @@ process_container() {
                     export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
                     "${hoist_script_notify[@]}"
                 fi
-                if [[ -n $effective_discord ]]; then
+                local _slack_msg="[$container_name] $status: $image_name"
+                if [[ -n $effective_discord ]] && ! _skip_for_rollup discord; then
                     log "$container_name: Sending Discord notification..."
                     send_discord_notification "$status" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
                 fi
-                if [[ -n $effective_generic ]]; then
+                if [[ -n $effective_generic ]] && ! _skip_for_rollup generic; then
                     log "$container_name: Sending generic webhook..."
                     send_generic_webhook "$status_generic" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 fi
-                if [[ -n $effective_slack ]]; then
+                if [[ -n $effective_slack ]] && ! _skip_for_rollup slack; then
                     log "$container_name: Sending Slack notification..."
-                    send_slack_notification "[$container_name] $status: $image_name" "$effective_slack"
+                    send_slack_notification "$_slack_msg" "$effective_slack"
                 fi
+                if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]] && ! _skip_for_rollup telegram; then
+                    log "$container_name: Sending Telegram notification..."
+                    send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
+                fi
+                if [[ -n $effective_gotify_url ]] && ! _skip_for_rollup gotify; then
+                    log "$container_name: Sending Gotify notification..."
+                    send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
+                fi
+                if [[ -n $effective_ntfy_url ]] && ! _skip_for_rollup ntfy; then
+                    log "$container_name: Sending ntfy notification..."
+                    send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
+                fi
+                if [[ -n $effective_teams_webhook ]] && ! _skip_for_rollup teams; then
+                    log "$container_name: Sending Teams notification..."
+                    send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
+                fi
+                if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]] && ! _skip_for_rollup matrix; then
+                    log "$container_name: Sending Matrix notification..."
+                    send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
+                        "$effective_matrix_room_id" "$effective_matrix_token"
+                fi
+                write_rollup_entry "$status_generic" "$container_name" "$image_name" \
+                    "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
                 _tokens+=("notified")
             fi
@@ -1272,18 +1770,26 @@ process_container() {
 print_summary() {
     local updated=0 update_failed=0 notified=0 no_change=0 skipped=0
     local would_update=0 would_notify=0
+    local paused=0 constraint_blocked=0 group_aborted=0
+    local unhealthy=0 rolled_back=0 rollback_failed=0
     local f token
     for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
         [[ -f $f ]] || continue
         while IFS= read -r token; do
             case "$token" in
-                updated)       (( updated++ )) ;;
-                update_failed) (( update_failed++ )) ;;
-                notified)      (( notified++ )) ;;
-                no_change)     (( no_change++ )) ;;
-                skipped)       (( skipped++ )) ;;
-                would_update)  (( would_update++ )) ;;
-                would_notify)  (( would_notify++ )) ;;
+                updated)            (( updated++ )) ;;
+                update_failed)      (( update_failed++ )) ;;
+                notified)           (( notified++ )) ;;
+                no_change)          (( no_change++ )) ;;
+                skipped)            (( skipped++ )) ;;
+                would_update)       (( would_update++ )) ;;
+                would_notify)       (( would_notify++ )) ;;
+                paused)             (( paused++ )) ;;
+                constraint_blocked) (( constraint_blocked++ )) ;;
+                group_aborted)      (( group_aborted++ )) ;;
+                unhealthy)          (( unhealthy++ )) ;;
+                rolled_back)        (( rolled_back++ )) ;;
+                rollback_failed)    (( rollback_failed++ )) ;;
             esac
         done < "$f"
     done
@@ -1296,16 +1802,22 @@ print_summary() {
         [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
         msg="Run complete: ${updated_part}, ${notified} notified, ${no_change} no-change, ${skipped} skipped"
     fi
+    [[ $unhealthy -gt 0 ]]          && msg+=", ${unhealthy} unhealthy"
+    [[ $rolled_back -gt 0 ]]        && msg+=", ${rolled_back} rolled-back"
+    [[ $rollback_failed -gt 0 ]]    && msg+=", ${rollback_failed} ROLLBACK-FAILED"
+    [[ $paused -gt 0 ]]             && msg+=", ${paused} paused"
+    [[ $constraint_blocked -gt 0 ]] && msg+=", ${constraint_blocked} constraint-blocked"
+    [[ $group_aborted -gt 0 ]]      && msg+=", ${group_aborted} group-aborted"
     log "$msg"
 }
 
 list_containers() {
-    printf '%-20s %-32s %-7s %-7s %s\n' "CONTAINER" "IMAGE" "UPDATE" "NOTIFY" "CACHED DIGEST"
+    printf '%-20s %-32s %-7s %-7s %-18s %s\n' "CONTAINER" "IMAGE" "UPDATE" "NOTIFY" "POLICY" "CACHED DIGEST"
     local container_name
     for container_name in "${containers[@]}"; do
         local inspect
         inspect=$("${DOCKER_BINARY}" inspect "$container_name" 2>/dev/null) || {
-            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(inspect failed)" "-" "-" "-"
+            printf '%-20s %-32s %-7s %-7s %-18s %s\n' "$container_name" "(inspect failed)" "-" "-" "-" "-"
             continue
         }
 
@@ -1314,15 +1826,19 @@ list_containers() {
             .[0] |
             .Config.Image,
             (.Config.Labels["com.sumguy.hoist\($tag).update"] // .Config.Labels["org.hotio.pullio\($tag).update"] // ""),
-            (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // "")
+            (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).pause_until"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).constraint"] // ""),
+            (.Config.Labels["com.sumguy.hoist\($tag).group"] // "")
         ' <<< "$inspect") || {
-            printf '%-20s %-32s %-7s %-7s %s\n' "$container_name" "(parse failed)" "-" "-" "-"
+            printf '%-20s %-32s %-7s %-7s %-18s %s\n' "$container_name" "(parse failed)" "-" "-" "-" "-"
             continue
         }
         readarray -t _lv <<< "$_jq_out"
 
         local image="${_lv[0]}" update_label="${_lv[1]}" notify_label="${_lv[2]}"
-        local update_col notify_col cached_col
+        local pause_label="${_lv[3]}" constraint_label="${_lv[4]}" group_label="${_lv[5]}"
+        local update_col notify_col policy_col cached_col
 
         if [[ -z $update_label && -z $notify_label ]]; then
             update_col="-"
@@ -1330,6 +1846,16 @@ list_containers() {
         else
             [[ $update_label == true ]] && update_col="yes" || update_col="no"
             [[ $notify_label == true ]] && notify_col="yes" || notify_col="no"
+        fi
+
+        local _policy_parts=()
+        [[ -n $pause_label ]]      && _policy_parts+=("paused:${pause_label}")
+        [[ -n $constraint_label ]] && _policy_parts+=("pin:${constraint_label}")
+        [[ -n $group_label ]]      && _policy_parts+=("group:${group_label}")
+        if [[ ${#_policy_parts[@]} -eq 0 ]]; then
+            policy_col="-"
+        else
+            policy_col=$(local IFS=','; printf '%s' "${_policy_parts[*]}")
         fi
 
         local safe_name
@@ -1343,12 +1869,10 @@ list_containers() {
             cached_col="-"
         fi
 
-        printf '%-20s %-32s %-7s %-7s %s\n' \
-            "$container_name" "$image" "$update_col" "$notify_col" "$cached_col"
+        printf '%-20s %-32s %-7s %-7s %-18s %s\n' \
+            "$container_name" "$image" "$update_col" "$notify_col" "$policy_col" "$cached_col"
     done
 }
-
-trap 'exit 130' INT
 
 if [[ $DO_CRON == true ]]; then
     _cron_dispatch
@@ -1365,19 +1889,60 @@ fi
 declare -a containers
 readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
 
+# Apply --only / --exclude filters
+if [[ -n "$ONLY_LIST" || -n "$EXCLUDE_LIST" ]]; then
+    declare -A _only_set _exclude_set
+    if [[ -n "$ONLY_LIST" ]]; then
+        IFS=',' read -ra _only_arr <<< "$ONLY_LIST"
+        for n in "${_only_arr[@]}"; do
+            [[ "$n" =~ ^[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] && n="${BASH_REMATCH[1]}" || n=""
+            [[ -n "$n" ]] && _only_set[$n]=1
+        done
+    fi
+    if [[ -n "$EXCLUDE_LIST" ]]; then
+        IFS=',' read -ra _excl_arr <<< "$EXCLUDE_LIST"
+        for n in "${_excl_arr[@]}"; do
+            [[ "$n" =~ ^[[:space:]]*(.*[^[:space:]])[[:space:]]*$ ]] && n="${BASH_REMATCH[1]}" || n=""
+            [[ -n "$n" ]] && _exclude_set[$n]=1
+        done
+    fi
+    declare -a _filtered=()
+    declare -A _seen_names=()
+    for c in "${containers[@]}"; do
+        _seen_names[$c]=1
+        if [[ -n "$ONLY_LIST" && -z "${_only_set[$c]+x}" ]]; then continue; fi
+        if [[ -n "${_exclude_set[$c]+x}" ]]; then continue; fi
+        _filtered+=("$c")
+    done
+    # Warn on unknown names in filter lists
+    for n in "${!_only_set[@]}";    do [[ -z "${_seen_names[$n]+x}" ]] && log "Warning: --only name '$n' not found among running containers"; done
+    for n in "${!_exclude_set[@]}"; do [[ -z "${_seen_names[$n]+x}" ]] && log "Warning: --exclude name '$n' not found among running containers"; done
+    containers=("${_filtered[@]}")
+fi
+
 if [[ $DO_LIST == true ]]; then
     list_containers
     exit 0
 fi
 
-rm -f "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null || true
+rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
 setup_environment
 check_maintenance_window
+_hc_ping start
 
 log "Processing ${#containers[@]} containers (parallelism: $PARALLEL)"
 
-if [[ $PARALLEL -gt 1 ]]; then
-    printf '%s\n' "${containers[@]}" | xargs -P "$PARALLEL" -I {} bash -c 'process_container "$@"' _ {}
+if (( PARALLEL > 1 )); then
+    running=0
+    for container_name in "${containers[@]}"; do
+        if (( running >= PARALLEL )); then
+            wait -n
+            (( running-- ))
+        fi
+        process_container "$container_name" &
+        (( running++ ))
+    done
+    wait
 else
     for container_name in "${containers[@]}"; do
         process_container "$container_name"
@@ -1385,8 +1950,16 @@ else
 fi
 
 print_summary
+send_rollup_notifications
 
 if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     log "Pruning docker images..."
     "${DOCKER_BINARY}" image prune --force
+fi
+
+# HC.io ping: /fail if any update_failed / unhealthy / rollback_failed token, success otherwise
+if grep -Elq '^(update_failed|unhealthy|rollback_failed)$' "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null; then
+    _hc_ping fail
+else
+    _hc_ping
 fi

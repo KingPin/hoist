@@ -27,6 +27,17 @@ CLI flags always override config file values.
 | `GLOBAL_DISCORD_WEBHOOK` | _(none)_ | Fallback Discord webhook for containers without a per-container label |
 | `GLOBAL_SLACK_WEBHOOK` | _(none)_ | Fallback Slack webhook |
 | `GLOBAL_GENERIC_WEBHOOK` | _(none)_ | Fallback generic webhook |
+| `GLOBAL_TELEGRAM_BOT_TOKEN` / `GLOBAL_TELEGRAM_CHAT_ID` | _(none)_ | Fallback Telegram bot credentials |
+| `GLOBAL_GOTIFY_URL` | _(none)_ | Fallback Gotify message URL (`?token=` in URL) |
+| `GLOBAL_NTFY_URL` / `GLOBAL_NTFY_TOKEN` | _(none)_ | Fallback ntfy.sh topic URL and optional bearer token |
+| `GLOBAL_TEAMS_WEBHOOK` | _(none)_ | Fallback Microsoft Teams incoming webhook |
+| `GLOBAL_MATRIX_HOMESERVER` / `GLOBAL_MATRIX_ROOM_ID` / `GLOBAL_MATRIX_TOKEN` | _(none)_ | Fallback Matrix room credentials |
+| `HEALTHCHECKS_PING_URL` | _(none)_ | Healthchecks.io heartbeat URL — pinged at start (`/start`), end (success), or `/fail` if any update failed |
+| `WEBHOOK_ROLLUP` | `false` | Send one summary webhook per run instead of per-container, for listed channels |
+| `WEBHOOK_ROLLUP_CHANNELS` | `discord,slack,generic` | Comma list of channels to roll up. Per-container labels are ignored for rolled-up channels. |
+| `HEALTHCHECK_TIMEOUT` | `120` | Default seconds to wait when `healthcheck.wait` is enabled (per-container override via `healthcheck.timeout`). |
+| `HEALTHCHECK_INTERVAL` | `2` | Poll interval in seconds while waiting for healthy. |
+| `ROLLBACK_DEFAULT` | `false` | When `true`, rollback applies to every container even without the `rollback` label. |
 | `MAINTENANCE_WINDOW` | _(none)_ | Only run during this time window (e.g. `02:00-06:00`). Midnight-spanning works: `22:00-04:00`. Dry-run bypasses this. |
 | `VERBOSE` | `false` | Log containers skipped due to missing hoist labels. Auto-enabled by `--dry-run`. |
 | `CURL_TIMEOUT` | `30` | Maximum time in seconds for webhook HTTP requests. |
@@ -73,7 +84,7 @@ For system-wide config, place `hoist.conf` at `/etc/hoist/hoist.conf`.
 
 - Docker with the `compose` subcommand (`docker compose`)
 - `jq`
-- Bash 4+ (macOS ships 3.2 by default — `brew install bash`)
+- Bash 4.3+ (macOS ships 3.2 by default — `brew install bash`)
 
 ## Usage
 
@@ -87,6 +98,8 @@ bash hoist.sh [options]
 | `--dry-run` | Show what would be updated without pulling, recreating, or notifying (implies `--verbose`) |
 | `--verbose` | Log containers skipped because they have no hoist labels |
 | `--parallel <N>` | Process containers concurrently with `N` workers |
+| `--only <names>` | Comma-separated list of container names to include (others ignored). Names not currently running emit a warning. |
+| `--exclude <names>` | Comma-separated list of container names to skip. Highest precedence — wins over `--only`. |
 | `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
 | `--update` | Self-update hoist to the latest GitHub release (interactive — prompts before replacing) |
 | `--force` | With `--update`, skip the confirmation prompt and reinstall even if already up to date |
@@ -115,9 +128,24 @@ services:
       com.sumguy.hoist.discord.webhook: "https://discord.com/api/webhooks/..."
       com.sumguy.hoist.slack.webhook: "https://hooks.slack.com/services/..."
       com.sumguy.hoist.generic.webhook: "https://example.com/webhook"
+      com.sumguy.hoist.telegram.bot_token: "123456:ABC..."
+      com.sumguy.hoist.telegram.chat_id: "-1001234567890"
+      com.sumguy.hoist.gotify.url: "https://gotify.example.com/message?token=XXX"
+      com.sumguy.hoist.ntfy.url: "https://ntfy.sh/your-topic"
+      com.sumguy.hoist.ntfy.token: "tk_..."    # optional bearer token
+      com.sumguy.hoist.teams.webhook: "https://outlook.office.com/webhook/..."
+      com.sumguy.hoist.matrix.homeserver: "https://matrix.org"
+      com.sumguy.hoist.matrix.room_id: "!abc123:matrix.org"
+      com.sumguy.hoist.matrix.token: "syt_..."
       com.sumguy.hoist.script.update: "/opt/scripts/pre-update.sh"
       com.sumguy.hoist.script.notify: "/opt/scripts/on-notify.sh"
       com.sumguy.hoist.registry.authfile: "/run/secrets/registry.json"
+      com.sumguy.hoist.pause_until: "2026-06-01"          # skip until this date/datetime
+      com.sumguy.hoist.constraint: "^1.2"                 # semver pin (^, ~, >=, <=, >, <, =)
+      com.sumguy.hoist.group: "db"                        # any group member's pull failure aborts the rest
+      com.sumguy.hoist.healthcheck.wait: "true"           # poll for healthy after recreate
+      com.sumguy.hoist.healthcheck.timeout: "180"         # seconds to wait (overrides config)
+      com.sumguy.hoist.rollback: "true"                   # re-tag prior SHA on update or healthcheck failure
 ```
 
 `update` and `notify` can both be set on the same container — it will update and then notify.
@@ -142,6 +170,25 @@ The `registry.authfile` label points to a JSON file:
   "password": "mytoken"
 }
 ```
+
+### Policy labels
+
+Three labels gate whether an update is applied (notifications still fire so you know what was held back):
+
+- **`pause_until`** — ISO date (`2026-06-01`) or datetime (`2026-06-01T15:00:00Z`). Hoist skips the container entirely until current time ≥ value. Emits the `paused` summary token. Unparseable values fail open with a warning, so a typo never silently pauses forever.
+- **`constraint`** — semver-style pin against the new image's `org.opencontainers.image.version` label. Supported operators: `^1.2`, `~1.2.3`, `>=1.0`, `<=2.0`, `>1.0`, `<2.0`, `=1.2.3`, or an exact `1.2.3`. If the candidate version violates, hoist skips the update, still notifies, and emits `constraint_blocked`. Images without an OCI version label fail open (cannot enforce). **Caveat — caret on 0.x:** hoist treats `^0.1.2` as "any `0.x` ≥ `0.1.2`" (same major). This differs from npm's "no minor bumps when major is 0" semantics. If you want npm-style behavior at major 0, use `~0.1.2` or an explicit range like `>=0.1.2,<0.2`.
+- **`group`** — free-form group name. If any container in the group has a pull failure, the others' updates are aborted (`group_aborted` token). Group atomicity is "soft" under `--parallel N`: a sibling may finish updating before its peer fails — accepted limitation. Group flags reset at the start of each run.
+
+### Container filters
+
+`--only foo,bar` and `--exclude baz,qux` filter which running containers hoist processes. `--exclude` wins over `--only`. Names that aren't currently running emit a warning but don't fail the run. Filters apply before label inspection — useful for ad-hoc maintenance without editing labels.
+
+### Healthcheck wait + rollback
+
+Two opt-in safety nets stack on top of the normal `compose up` flow:
+
+- **`healthcheck.wait`** — after `compose up` succeeds, hoist polls `docker inspect --format '{{.State.Health.Status}}'`. Reaches `healthy`: success. `unhealthy`/`exited`/timeout: emits the `unhealthy` token. Per-container `healthcheck.timeout` overrides the global `HEALTHCHECK_TIMEOUT` (default 120s, polled every `HEALTHCHECK_INTERVAL` seconds — default 2). **Images without a `HEALTHCHECK` directive** fall back to `.State.Status`, which only distinguishes `running` from `exited`. A warning is logged and the wait succeeds the moment the container is `running` — add a real `HEALTHCHECK` to the image if you need stronger guarantees.
+- **`rollback`** — on update failure OR unhealthy outcome, hoist re-aliases the prior image SHA back onto the original tag and re-runs `compose up --no-pull`. Emits `rolled_back` on success, `rollback_failed` on failure. **Caveat:** the old image must still be present locally. If `PRUNE_IMAGES=true` removed it between runs, rollback fails clearly with `rollback_failed` rather than silently. Set `ROLLBACK_DEFAULT=true` in config to enable rollback for every container without per-container labels.
 
 ## Custom scripts
 
@@ -218,6 +265,22 @@ On macOS, hoist points you at a launchd plist example. See
 **Discord** — sends a rich embed with image name, digest diff, and version/revision if the image exposes `org.opencontainers.image.version` and `org.opencontainers.image.revision` labels.
 
 **Slack** — sends a plain text message: `[container] Update available: image:tag`
+
+**Telegram** — sends a plain text message via the Bot API. Requires `bot_token` (from BotFather) and `chat_id` (negative for groups, positive for users).
+
+**Gotify** — sends a `{title, message, priority}` payload. Token goes in the URL: `https://gotify.example.com/message?token=XXX`.
+
+**ntfy** — POSTs the message body to your ntfy topic URL. Title goes in the `Title:` header. Optional `token` adds bearer auth for protected topics.
+
+**Microsoft Teams** — sends an `MessageCard` (Office 365 connector format). Use the incoming-webhook URL for your channel.
+
+**Matrix** — PUTs an `m.text` message into a room. Requires `homeserver` (e.g. `https://matrix.org`), `room_id`, and an `access_token`.
+
+**Healthchecks.io** — set `HEALTHCHECKS_PING_URL` to a check URL. Hoist pings `/start` at run start, the bare URL on success, and `/fail` if any container's update failed. Best-effort — failed pings don't block the run.
+
+### Webhook rollup
+
+Set `WEBHOOK_ROLLUP=true` (and adjust `WEBHOOK_ROLLUP_CHANNELS`) to receive one summary message per run instead of one per container. The rolled-up message is sent to the corresponding `GLOBAL_*` webhook for each listed channel. Per-container webhook labels are ignored for rolled-up channels; channels not in the rollup list keep their normal per-container behavior.
 
 **Generic webhook** — POST with JSON body:
 
