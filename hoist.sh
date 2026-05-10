@@ -1192,7 +1192,7 @@ _cron_dispatch() {
 send_discord_notification() {
     local description="$1" container="$2" old_version="$3" new_version="$4"
     local image="$5" webhook="$6" old_revision="$7" new_revision="$8"
-    local old_digest="$9" new_digest="${10}" color="${11:-768753}"
+    local old_digest="$9" new_digest="${10}" color="${11:-3447003}"
     local v_ind=">" r_ind=">" d_ind=">"
     [[ $old_digest == "$new_digest" ]] && d_ind="="
 
@@ -1388,7 +1388,7 @@ send_rollup_notifications() {
                 [[ -n $GLOBAL_DISCORD_WEBHOOK ]] || continue
                 log "Rollup: sending Discord summary..."
                 send_discord_notification "$title" "rollup" "" "" "$message" \
-                    "$GLOBAL_DISCORD_WEBHOOK" "" "" "" "" 768753 || true ;;
+                    "$GLOBAL_DISCORD_WEBHOOK" "" "" "" "" 3447003 || true ;;
             slack)
                 [[ -n $GLOBAL_SLACK_WEBHOOK ]] || continue
                 log "Rollup: sending Slack summary..."
@@ -1614,7 +1614,7 @@ process_container() {
             new_oci_revision="${_img[2]}"
         fi
 
-        local status="🔄 Update available" status_generic="update_available" color=768753
+        local status="🔄 Update available" status_generic="update_available" color=3447003
 
         # Constraint check: if violated, block update but still allow notify
         local _constraint_blocked=false
@@ -1637,6 +1637,9 @@ process_container() {
                 log "$container_name: group '$hoist_group' has a failed peer — aborting update"
                 _group_aborted=true
                 _tokens+=("group_aborted")
+                status="🚫 Update aborted (group '${hoist_group}' had a failed peer)"
+                status_generic="update_aborted"
+                color=15105570
             fi
         fi
 
