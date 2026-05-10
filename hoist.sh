@@ -1855,7 +1855,7 @@ list_containers() {
         if [[ ${#_policy_parts[@]} -eq 0 ]]; then
             policy_col="-"
         else
-            policy_col=$(IFS=,; printf '%s' "${_policy_parts[*]}")
+            policy_col=$(local IFS=','; printf '%s' "${_policy_parts[*]}")
         fi
 
         local safe_name
