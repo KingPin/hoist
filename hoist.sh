@@ -40,6 +40,7 @@ CRON_ACTION=""
 CRON_SCHEDULE_FLAG=""
 CRON_USER_FLAG=""
 CRON_BACKEND_FLAG=""
+CRON_SCOPE_FLAG=""
 ONLY_LIST=""
 EXCLUDE_LIST=""
 
@@ -100,6 +101,10 @@ while [[ "$1" != "" ]]; do
                   [[ -n $CRON_BACKEND_FLAG ]] || { echo "Error: --backend requires a value" >&2; exit 2; } ;;
     --backend)    [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --backend requires a value" >&2; exit 2; }
                   CRON_BACKEND_FLAG="$2"; shift ;;
+    --scope=*)    CRON_SCOPE_FLAG="${1#*=}"
+                  [[ -n $CRON_SCOPE_FLAG ]] || { echo "Error: --scope requires a value" >&2; exit 2; } ;;
+    --scope)      [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --scope requires a value" >&2; exit 2; }
+                  CRON_SCOPE_FLAG="$2"; shift ;;
     -h|--help|-\?)
         cat <<EOF
 hoist v${HOIST_VERSION} — auto-update or notify on Docker containers via labels
@@ -132,8 +137,12 @@ Scheduling:
   --schedule <expr>  Schedule for --cron install/print. Presets:
                        30min, hourly, 6hourly, daily, weekly
                      or a raw cron / OnCalendar expression.
-  --user <name>      User to run hoist as (--cron install). Default: root.
+  --scope <scope>    Install scope for --cron install: user | system.
+                     user: systemd --user units, no sudo needed.
+                     system: /etc/cron.d or /etc/systemd/system/ (default for root).
+  --user <name>      User to run hoist as (--cron install, system scope). Default: root.
   --backend <name>   Force backend: cron | systemd. Default: auto-detect.
+                     cron backend is only available with --scope system.
 
 Config file (sourced before CLI flag parsing):
   \$HOIST_CONFIG, ./hoist.conf, or /etc/hoist/hoist.conf
@@ -654,6 +663,9 @@ _CRON_PATH_D="/etc/cron.d/hoist"
 _CRON_LOG_FILE="/var/log/hoist.log"
 _CRON_SYSTEMD_SERVICE="/etc/systemd/system/hoist.service"
 _CRON_SYSTEMD_TIMER="/etc/systemd/system/hoist.timer"
+_CRON_SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+_CRON_SYSTEMD_USER_SERVICE="$_CRON_SYSTEMD_USER_DIR/hoist.service"
+_CRON_SYSTEMD_USER_TIMER="$_CRON_SYSTEMD_USER_DIR/hoist.timer"
 _CRON_MARKER="# Managed by hoist --cron install"
 
 # Run a command with sudo iff the nearest existing ancestor of target isn't
@@ -950,6 +962,108 @@ _systemd_backend_status() {
     return 0
 }
 
+# ----- systemd user backend -----
+
+_systemd_render_service_user() {
+    local hoist_bin="$1"
+    cat <<EOF
+${_CRON_MARKER} — do not edit; re-run \`hoist --cron install\` to change.
+[Unit]
+Description=Hoist — auto-update Docker containers via labels
+
+[Service]
+Type=oneshot
+ExecStart=${hoist_bin}
+EOF
+}
+
+_systemd_render_timer_user() {
+    local on_calendar="$1"
+    cat <<EOF
+${_CRON_MARKER} — do not edit; re-run \`hoist --cron install\` to change.
+[Unit]
+Description=Run hoist on schedule
+
+[Timer]
+OnCalendar=${on_calendar}
+Persistent=true
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+_systemd_user_backend_install() {
+    local on_calendar="$1" hoist_bin="$2"
+    local f
+    for f in "$_CRON_SYSTEMD_USER_SERVICE" "$_CRON_SYSTEMD_USER_TIMER"; do
+        if [[ -e $f ]] && ! head -n1 "$f" 2>/dev/null | grep -qF "$_CRON_MARKER"; then
+            log "Error: refusing to overwrite hand-managed $f (no hoist marker found)"
+            return 1
+        fi
+    done
+
+    local svc tmr
+    svc=$(_systemd_render_service_user "$hoist_bin")
+    tmr=$(_systemd_render_timer_user "$on_calendar")
+
+    if [[ $DRY_RUN == true ]]; then
+        log "[dry-run] would write $_CRON_SYSTEMD_USER_SERVICE:"
+        printf '%s\n' "$svc" | sed 's/^/    /'
+        log "[dry-run] would write $_CRON_SYSTEMD_USER_TIMER:"
+        printf '%s\n' "$tmr" | sed 's/^/    /'
+        log "[dry-run] would: systemctl --user daemon-reload && systemctl --user enable --now hoist.timer"
+        return 0
+    fi
+
+    mkdir -p "$_CRON_SYSTEMD_USER_DIR" \
+        || { log "Error: cannot create $_CRON_SYSTEMD_USER_DIR"; return 1; }
+    printf '%s\n' "$svc" > "$_CRON_SYSTEMD_USER_SERVICE" \
+        || { log "Error: failed to write $_CRON_SYSTEMD_USER_SERVICE"; return 1; }
+    printf '%s\n' "$tmr" > "$_CRON_SYSTEMD_USER_TIMER" \
+        || { log "Error: failed to write $_CRON_SYSTEMD_USER_TIMER"; return 1; }
+    systemctl --user daemon-reload || return 1
+    systemctl --user enable --now hoist.timer || return 1
+    log "Installed user hoist.timer (OnCalendar=$on_calendar)"
+    log "Logs: journalctl --user -u hoist.service"
+    if ! loginctl show-user "$USER" 2>/dev/null | grep -q "^Linger=yes"; then
+        log "Tip: run 'loginctl enable-linger $USER' so the timer starts at boot without a login session"
+    fi
+}
+
+_systemd_user_backend_remove() {
+    local found=false f
+    for f in "$_CRON_SYSTEMD_USER_SERVICE" "$_CRON_SYSTEMD_USER_TIMER"; do
+        [[ -e $f ]] || continue
+        found=true
+        head -n1 "$f" 2>/dev/null | grep -qF "$_CRON_MARKER" \
+            || { log "Error: $f is not hoist-managed — refusing to remove"; return 1; }
+    done
+    if [[ $found == false ]]; then
+        log "systemd (user): nothing to remove"
+        return 0
+    fi
+    if [[ $DRY_RUN == true ]]; then
+        log "[dry-run] would: systemctl --user disable --now hoist.timer; rm hoist.{service,timer}; --user daemon-reload"
+        return 0
+    fi
+    systemctl --user disable --now hoist.timer 2>/dev/null || true
+    rm -f "$_CRON_SYSTEMD_USER_SERVICE" "$_CRON_SYSTEMD_USER_TIMER" || return 1
+    systemctl --user daemon-reload || return 1
+    log "Removed user hoist.service and hoist.timer"
+}
+
+_systemd_user_backend_status() {
+    [[ -e $_CRON_SYSTEMD_USER_TIMER ]] || return 1
+    if head -n1 "$_CRON_SYSTEMD_USER_TIMER" 2>/dev/null | grep -qF "$_CRON_MARKER"; then
+        log "systemd (user): managed timer at $_CRON_SYSTEMD_USER_TIMER"
+        systemctl --user list-timers hoist.timer --all 2>/dev/null | head -n2 | sed 's/^/    /'
+    else
+        log "systemd (user): $_CRON_SYSTEMD_USER_TIMER exists but is NOT hoist-managed"
+    fi
+    return 0
+}
+
 # ----- launchd doc fallback (macOS) -----
 
 _launchd_doc() {
@@ -964,6 +1078,50 @@ EOF
 }
 
 # ----- prompts (write to stderr; echo result on stdout) -----
+
+_prompt_scope() {
+    {
+        echo "Install scope:"
+        echo "  user   — systemd --user units in ~/.config/systemd/user/ (no sudo needed)"
+        echo "  system — /etc/cron.d or /etc/systemd/system/ (sudo may be required)"
+    } >&2
+    local ans
+    read -rp "Scope [user]: " ans >&2
+    ans="${ans:-user}"
+    case "${ans,,}" in
+        user|system) printf '%s' "${ans,,}" ;;
+        *) echo "Error: invalid scope: $ans (expected 'user' or 'system')" >&2; return 1 ;;
+    esac
+}
+
+_cron_user_no_systemd_guidance() {
+    local hoist_bin="$1"
+    cat >&2 <<EOF
+User-scope scheduling requires systemd, which was not detected on this system.
+
+To schedule hoist with cron you need to install a file into /etc/cron.d/ (system-wide,
+requires root). Options:
+
+  sudo hoist --cron install --scope system --schedule <preset> --user <name>
+
+Or generate the file and place it yourself:
+
+  hoist --cron print --schedule <preset> --user <name> | sudo tee /etc/cron.d/hoist
+
+EOF
+    if [[ -t 1 ]]; then
+        local ans
+        read -rp "Print a sample /etc/cron.d/hoist file now? [y/N] " ans >&2
+        if [[ ${ans,,} == y ]]; then
+            local schedule_input run_user schedule_expr
+            schedule_input=$(_prompt_schedule) || return 1
+            run_user=$(_prompt_user) || return 1
+            schedule_expr=$(_cron_render_schedule cron "$schedule_input") || return 1
+            _cron_render_file "$schedule_expr" "$run_user" "$hoist_bin"
+        fi
+    fi
+    return 2
+}
 
 _prompt_backend() {
     local detected="$1"
@@ -1030,6 +1188,7 @@ _cron_install_orchestrate() {
     local schedule_input="${CRON_SCHEDULE_FLAG:-}"
     local run_user="${CRON_USER_FLAG:-}"
     local backend="${CRON_BACKEND_FLAG:-}"
+    local scope="${CRON_SCOPE_FLAG:-}"
     local detected
     detected=$(_detect_scheduler)
     case "$detected" in
@@ -1037,27 +1196,73 @@ _cron_install_orchestrate() {
         none)        log "Error: no supported scheduler found (need cron or systemd)"; return 1 ;;
     esac
 
-    if [[ -n $backend ]]; then
-        if [[ $backend != cron && $backend != systemd ]]; then
-            log "Error: --backend must be 'cron' or 'systemd' (got: $backend)"; return 1
-        fi
-        if [[ $detected != both && $detected != "$backend" ]]; then
-            log "Error: --backend $backend requested but only '$detected' is available"; return 1
-        fi
+    if [[ -n $backend && $backend != cron && $backend != systemd ]]; then
+        log "Error: --backend must be 'cron' or 'systemd' (got: $backend)"; return 1
     fi
+    if [[ -n $backend && $detected != both && $detected != "$backend" ]]; then
+        log "Error: --backend $backend requested but only '$detected' is available"; return 1
+    fi
+    if [[ -n $scope && $scope != user && $scope != system ]]; then
+        log "Error: --scope must be 'user' or 'system' (got: $scope)"; return 1
+    fi
+
+    # Root always installs system-wide; skip the scope prompt.
+    [[ $EUID -eq 0 ]] && scope=system
 
     # Fail fast on non-TTY when a prompt would be required.
     local needs_prompt=false
     [[ -z $schedule_input ]] && needs_prompt=true
-    [[ -z $run_user ]] && needs_prompt=true
-    [[ $detected == both && -z $backend ]] && needs_prompt=true
+    [[ $EUID -ne 0 && -z $scope ]] && needs_prompt=true
+    [[ ( -z $scope || $scope == system ) && -z $run_user ]] && needs_prompt=true
+    [[ $detected == both && -z $backend && ( -z $scope || $scope == system ) ]] && needs_prompt=true
     if [[ $needs_prompt == true && ! -t 0 ]]; then
         log "Error: --cron install needs an interactive terminal for missing values."
-        log "  Pass --schedule, --user$([[ $detected == both ]] && printf %s ', --backend') to run non-interactively."
+        local flags="--schedule"
+        [[ $EUID -ne 0 ]] && flags="$flags, --scope"
+        [[ -z $scope || $scope == system ]] && flags="$flags, --user"
+        [[ $detected == both && ( -z $scope || $scope == system ) ]] && flags="$flags, --backend"
+        log "  Pass $flags to run non-interactively."
         return 1
     fi
 
-    [[ -n $backend ]]       || backend=$(_prompt_backend "$detected") || return 1
+    [[ -n $scope ]] || scope=$(_prompt_scope) || return 1
+
+    # ---- user scope: systemd --user only ----
+    if [[ $scope == user ]]; then
+        if [[ -n $backend && $backend == cron ]]; then
+            log "Error: --backend cron is not supported with --scope user."
+            log "  Use --scope system for cron, or omit --backend to use systemd --user."
+            return 1
+        fi
+        if [[ $detected != systemd && $detected != both ]]; then
+            local hoist_bin; hoist_bin=$(_resolve_hoist_path) || return 1
+            _cron_user_no_systemd_guidance "$hoist_bin"
+            return $?
+        fi
+        backend=systemd
+        [[ -n $schedule_input ]] || schedule_input=$(_prompt_schedule) || return 1
+        local schedule_expr
+        schedule_expr=$(_cron_render_schedule "$backend" "$schedule_input") || return 1
+        local hoist_bin; hoist_bin=$(_resolve_hoist_path) || return 1
+
+        local fully_scripted=false
+        [[ -n ${CRON_SCHEDULE_FLAG:-} && -n ${CRON_SCOPE_FLAG:-} ]] && fully_scripted=true
+
+        if [[ $DRY_RUN != true && $fully_scripted == false ]]; then
+            log "About to install (user scope):"
+            log "  units:     $_CRON_SYSTEMD_USER_DIR"
+            log "  schedule:  $schedule_expr"
+            log "  hoist bin: $hoist_bin"
+            local ans
+            read -rp "Proceed? [y/N] " ans
+            [[ ${ans,,} == y ]] || { log "Cancelled."; return 0; }
+        fi
+        _systemd_user_backend_install "$schedule_expr" "$hoist_bin"
+        return $?
+    fi
+
+    # ---- system scope: existing flow ----
+    [[ -n $backend ]]        || backend=$(_prompt_backend "$detected") || return 1
     [[ -n $schedule_input ]] || schedule_input=$(_prompt_schedule) || return 1
     if [[ -n $run_user ]]; then
         _validate_user "$run_user" || return 1
@@ -1104,6 +1309,9 @@ _cron_remove_orchestrate() {
     if [[ -e $_CRON_SYSTEMD_TIMER || -e $_CRON_SYSTEMD_SERVICE ]]; then
         if _systemd_backend_remove; then removed_any=true; else return 1; fi
     fi
+    if [[ -e $_CRON_SYSTEMD_USER_TIMER || -e $_CRON_SYSTEMD_USER_SERVICE ]]; then
+        if _systemd_user_backend_remove; then removed_any=true; else return 1; fi
+    fi
     [[ $removed_any == true ]] || log "Nothing to remove."
     return 0
 }
@@ -1146,8 +1354,9 @@ _cron_status_orchestrate() {
     local detected; detected=$(_detect_scheduler)
     log "Detected scheduler(s): $detected"
     local found=false
-    _cron_backend_status     && found=true
-    _systemd_backend_status  && found=true
+    _cron_backend_status          && found=true
+    _systemd_backend_status       && found=true
+    _systemd_user_backend_status  && found=true
     if [[ $found == false ]]; then
         log "No managed schedule installed."
         return 1

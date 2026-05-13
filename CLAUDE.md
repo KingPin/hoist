@@ -24,7 +24,7 @@ bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>] [--list] [--update]
 - `--parallel N` uses `xargs -P N` to process containers concurrently
 - `--list` / `--status` prints a table of running containers + their hoist labels and cached digest, then exits before any pulls
 - `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--version` prints `HOIST_VERSION` and exits
-- `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and `--user <name>` (and `--backend cron|systemd` if both are present on the host)
+- `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and, for system scope, `--user <name>` (and `--backend cron|systemd` if both are present). Non-root users are also asked `--scope user|system`; root always defaults to system scope.
 
 ## Architecture
 
@@ -103,16 +103,24 @@ When `script.update` or `script.notify` runs, these `HOIST_*` env vars are set:
 
 Two backends, auto-detected by `_detect_scheduler` (`hoist.sh:486-506`):
 
-- **cron** — writes `/etc/cron.d/hoist` (a single file, with managed marker on line 1).
-- **systemd** — writes `/etc/systemd/system/hoist.service` + `hoist.timer`, then `daemon-reload` + `enable --now hoist.timer`.
+Two scopes, chosen via `--scope user|system` (non-root users are prompted; root always gets system):
 
-On hosts where only one is present, the backend is chosen for you. On hosts with both (`detected == both`), non-interactive runs require `--backend`.
+- **system scope** — installs to system-wide paths, may require sudo:
+  - **cron** backend: writes `/etc/cron.d/hoist` (single file, managed marker on line 1).
+  - **systemd** backend: writes `/etc/systemd/system/hoist.service` + `hoist.timer`, then `daemon-reload` + `enable --now hoist.timer`.
+  - On hosts with only one backend, it is chosen automatically. On hosts with both, non-interactive runs require `--backend`.
+- **user scope** — systemd only, no sudo needed:
+  - Writes `~/.config/systemd/user/hoist.service` + `hoist.timer` (respects `$XDG_CONFIG_HOME`).
+  - No `User=` directive (user units run as the owning user). No docker dependency in `[Unit]` (user units cannot depend on system units). Timer uses `WantedBy=default.target`.
+  - Enabled with `systemctl --user enable --now hoist.timer`.
+  - After install, hoist suggests `loginctl enable-linger $USER` if linger is not already set (needed for the timer to survive without an active login session).
+  - If systemd is not available and `--scope user` is requested, hoist prints cron setup instructions and optionally generates the `/etc/cron.d/hoist` file for the user to place manually.
 
-Non-interactive contract (`hoist.sh:850-857`): `install` needs `--schedule` (preset `30min|hourly|6hourly|daily|weekly` or a raw cron / `OnCalendar` expression) and `--user`. If any required value is missing and stdin isn't a TTY, hoist prints a clear error and exits — it never hangs waiting for input.
+Non-interactive contract: `install` needs `--schedule` (preset `30min|hourly|6hourly|daily|weekly` or a raw cron / `OnCalendar` expression). System scope also requires `--user`. Non-root callers additionally need `--scope`. If any required value is missing and stdin isn't a TTY, hoist prints a clear error and exits — it never hangs waiting for input.
 
-Idempotency is marker-based: every managed file gets `# Managed by hoist --cron install` on line 1 (`_CRON_MARKER`, `hoist.sh:457`). `install` refuses to overwrite a file that doesn't carry the marker; `remove` refuses to delete one that doesn't. Re-running `install` is safe — it always rewrites the unit/cron file (and emits `Installed …`), so config-management tools should expect "changed" on every run rather than try to fake idempotence on top.
+Idempotency is marker-based: every managed file gets `# Managed by hoist --cron install` on line 1 (`_CRON_MARKER`). `install` refuses to overwrite a file that doesn't carry the marker; `remove` refuses to delete one that doesn't. Re-running `install` is safe — it always rewrites the unit/cron file (and emits `Installed …`), so config-management tools should expect "changed" on every run rather than try to fake idempotence on top.
 
-Privilege handling lives in `_sudo_if_needed` (`hoist.sh:461-475`): walks up to the nearest existing ancestor of the target path and only escalates to `sudo` when that path isn't writable. Plays cleanly with Ansible `become` and the standalone `install.sh`.
+Privilege handling lives in `_sudo_if_needed`: walks up to the nearest existing ancestor of the target path and only escalates to `sudo` when that path isn't writable. User-scope installs write to `~HOME` and never call `_sudo_if_needed`. Plays cleanly with Ansible `become` and the standalone `install.sh`.
 
 `systemd-analyze` is **only** required when validating a custom `OnCalendar` expression on the systemd backend (`hoist.sh:537-546`). Presets short-circuit validation. macOS targets aren't supported — `_launchd_doc` (`hoist.sh:755-764`) prints a pointer to `docs/scheduling.md` and returns 2.
 
