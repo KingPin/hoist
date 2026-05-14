@@ -1768,6 +1768,15 @@ process_container() {
     fi
 
     if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
+        if [[ -n $docker_compose_workdir && -n $docker_compose_service ]]; then
+            local _dedup_key
+            _dedup_key=$(printf '%s:%s' "$docker_compose_workdir" "$docker_compose_service" \
+                | tr -cs '[:alnum:]._-' '_')
+            if ! mkdir "${CACHE_LOCATION}/hoist-compose-${_dedup_key}.deduped" 2>/dev/null; then
+                [[ $VERBOSE == true ]] && log "$container_name: replica of '$docker_compose_service' already processed this run — skipping"
+                return 0
+            fi
+        fi
         if [[ -n $hoist_pause_until ]] && ! _check_pause_until "$hoist_pause_until"; then
             log "$container_name: paused until $hoist_pause_until"
             _tokens+=("paused")
@@ -2160,6 +2169,7 @@ if [[ $DO_LIST == true ]]; then
 fi
 
 rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
+rmdir "${CACHE_LOCATION}"/hoist-compose-*.deduped 2>/dev/null || true
 setup_environment
 check_maintenance_window
 _hc_ping start
