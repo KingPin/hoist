@@ -114,6 +114,7 @@ Two scopes, chosen via `--scope user|system` (non-root users are prompted; root 
   - No `User=` directive (user units run as the owning user). No docker dependency in `[Unit]` (user units cannot depend on system units). Timer uses `WantedBy=default.target`.
   - Enabled with `systemctl --user enable --now hoist.timer`.
   - After install, hoist suggests `loginctl enable-linger $USER` if linger is not already set (needed for the timer to survive without an active login session).
+  - **Rootless docker auto-pin**: at install time, `_detect_user_docker_host` checks whether `DOCKER_HOST` is set in the caller's env, *not* already exported into `systemctl --user show-environment`, and no docker context is steering the connection (`docker context show` == `default`). If all three are true, the install bakes `Environment=DOCKER_HOST=<value>` into `hoist.service` so the timer-fired run matches the user's interactive shell. Context-based rootless setups need nothing — they already work via `~/.docker/config.json`.
   - If systemd is not available and `--scope user` is requested, hoist prints cron setup instructions and optionally generates the `/etc/cron.d/hoist` file for the user to place manually.
 
 Non-interactive contract: `install` needs `--schedule` (preset `30min|hourly|6hourly|daily|weekly` or a raw cron / `OnCalendar` expression). System scope also requires `--user`. Non-root callers additionally need `--scope`. If any required value is missing and stdin isn't a TTY, hoist prints a clear error and exits — it never hangs waiting for input.

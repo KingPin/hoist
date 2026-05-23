@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.5.1"
+HOIST_VERSION="1.6.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -966,6 +966,7 @@ _systemd_backend_status() {
 
 _systemd_render_service_user() {
     local hoist_bin="$1"
+    local env_lines="$2"
     cat <<EOF
 ${_CRON_MARKER} — do not edit; re-run \`hoist --cron install\` to change.
 [Unit]
@@ -973,8 +974,26 @@ Description=Hoist — auto-update Docker containers via labels
 
 [Service]
 Type=oneshot
-ExecStart=${hoist_bin}
+${env_lines}ExecStart=${hoist_bin}
 EOF
+}
+
+# Decide whether to pin DOCKER_HOST into the user unit.
+# Returns the value to pin on stdout, or empty if no pin is needed.
+# Heuristic: pin only when DOCKER_HOST is set in the caller's env (so we know
+# the user relies on it) AND the user manager doesn't already have it AND
+# no docker context is steering the connection. This covers the common
+# rootless-docker case where DOCKER_HOST lives in ~/.zshrc / ~/.bashrc and
+# would silently disappear under a systemd --user timer.
+_detect_user_docker_host() {
+    [[ -n ${DOCKER_HOST:-} ]] || return 0
+    if systemctl --user show-environment 2>/dev/null | grep -q '^DOCKER_HOST='; then
+        return 0
+    fi
+    local ctx
+    ctx=$(docker context show 2>/dev/null || true)
+    [[ -z $ctx || $ctx == default ]] || return 0
+    printf '%s' "$DOCKER_HOST"
 }
 
 _systemd_render_timer_user() {
@@ -1003,8 +1022,14 @@ _systemd_user_backend_install() {
         fi
     done
 
+    local pinned_docker_host env_lines=""
+    pinned_docker_host=$(_detect_user_docker_host)
+    if [[ -n $pinned_docker_host ]]; then
+        env_lines="Environment=DOCKER_HOST=${pinned_docker_host}"$'\n'
+    fi
+
     local svc tmr
-    svc=$(_systemd_render_service_user "$hoist_bin")
+    svc=$(_systemd_render_service_user "$hoist_bin" "$env_lines")
     tmr=$(_systemd_render_timer_user "$on_calendar")
 
     if [[ $DRY_RUN == true ]]; then
@@ -1013,6 +1038,8 @@ _systemd_user_backend_install() {
         log "[dry-run] would write $_CRON_SYSTEMD_USER_TIMER:"
         printf '%s\n' "$tmr" | sed 's/^/    /'
         log "[dry-run] would: systemctl --user daemon-reload && systemctl --user enable --now hoist.timer"
+        [[ -n $pinned_docker_host ]] && \
+            log "[dry-run] would pin DOCKER_HOST=${pinned_docker_host} (not in user systemd env)"
         return 0
     fi
 
@@ -1025,6 +1052,8 @@ _systemd_user_backend_install() {
     systemctl --user daemon-reload || return 1
     systemctl --user enable --now hoist.timer || return 1
     log "Installed user hoist.timer (OnCalendar=$on_calendar)"
+    [[ -n $pinned_docker_host ]] && \
+        log "Pinned DOCKER_HOST=${pinned_docker_host} into hoist.service (rootless docker detected)"
     log "Logs: journalctl --user -u hoist.service"
     if ! loginctl show-user "$USER" 2>/dev/null | grep -q "^Linger=yes"; then
         log "Tip: run 'loginctl enable-linger $USER' so the timer starts at boot without a login session"
