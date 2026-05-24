@@ -554,7 +554,18 @@ _self_update_apply() {
         _suu_cleanup; return 1
     fi
 
-    chmod +x "$tmp_script"
+    # Preserve original file mode and ownership so the replaced script remains
+    # readable/executable for non-root users (mktemp creates 0600, which would
+    # otherwise lock everyone but the updater out).
+    local orig_mode orig_owner
+    orig_mode=$(stat -c '%a' "$script_path" 2>/dev/null)
+    [[ -z $orig_mode ]] && orig_mode=$(stat -f '%Lp' "$script_path" 2>/dev/null)
+    [[ -z $orig_mode ]] && orig_mode=755
+    orig_owner=$(stat -c '%u:%g' "$script_path" 2>/dev/null)
+    [[ -z $orig_owner ]] && orig_owner=$(stat -f '%u:%g' "$script_path" 2>/dev/null)
+
+    chmod "$orig_mode" "$tmp_script" || chmod +x "$tmp_script"
+    [[ -n $orig_owner ]] && chown "$orig_owner" "$tmp_script" 2>/dev/null
     mv "$tmp_script" "$script_path" || { log "Error: mv failed — update aborted"; _suu_cleanup; return 1; }
     log "Updated to v${new_ver}. Restart hoist to use the new version."
     rm -f "$tmp_sha256" "${CACHE_LOCATION}/hoist-self-v${new_ver}.notified"
