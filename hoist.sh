@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.6.0"
+HOIST_VERSION="1.7.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -41,6 +41,7 @@ CRON_SCHEDULE_FLAG=""
 CRON_USER_FLAG=""
 CRON_BACKEND_FLAG=""
 CRON_SCOPE_FLAG=""
+CRON_DOCKER_HOST_FLAG=""
 ONLY_LIST=""
 EXCLUDE_LIST=""
 
@@ -105,6 +106,10 @@ while [[ "$1" != "" ]]; do
                   [[ -n $CRON_SCOPE_FLAG ]] || { echo "Error: --scope requires a value" >&2; exit 2; } ;;
     --scope)      [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --scope requires a value" >&2; exit 2; }
                   CRON_SCOPE_FLAG="$2"; shift ;;
+    --docker-host=*) CRON_DOCKER_HOST_FLAG="${1#*=}"
+                     [[ -n $CRON_DOCKER_HOST_FLAG ]] || { echo "Error: --docker-host requires a value" >&2; exit 2; } ;;
+    --docker-host)   [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --docker-host requires a value" >&2; exit 2; }
+                     CRON_DOCKER_HOST_FLAG="$2"; shift ;;
     -h|--help|-\?)
         cat <<EOF
 hoist v${HOIST_VERSION} — auto-update or notify on Docker containers via labels
@@ -143,6 +148,11 @@ Scheduling:
   --user <name>      User to run hoist as (--cron install, system scope). Default: root.
   --backend <name>   Force backend: cron | systemd. Default: auto-detect.
                      cron backend is only available with --scope system.
+  --docker-host <uri> Pin DOCKER_HOST in the generated user unit
+                     (--cron install, --scope user only). Overrides
+                     auto-detect. Use this for rootless docker on a
+                     non-default socket, or in non-interactive automation
+                     where DOCKER_HOST isn't set in the calling shell.
 
 Config file (sourced before CLI flag parsing):
   \$HOIST_CONFIG, ./hoist.conf, or /etc/hoist/hoist.conf
@@ -980,12 +990,17 @@ EOF
 
 # Decide whether to pin DOCKER_HOST into the user unit.
 # Returns the value to pin on stdout, or empty if no pin is needed.
-# Heuristic: pin only when DOCKER_HOST is set in the caller's env (so we know
-# the user relies on it) AND the user manager doesn't already have it AND
-# no docker context is steering the connection. This covers the common
-# rootless-docker case where DOCKER_HOST lives in ~/.zshrc / ~/.bashrc and
-# would silently disappear under a systemd --user timer.
+# Precedence: explicit --docker-host flag wins. Otherwise auto-detect: pin
+# only when DOCKER_HOST is set in the caller's env (so we know the user
+# relies on it) AND the user manager doesn't already have it AND no docker
+# context is steering the connection. This covers the common rootless-docker
+# case where DOCKER_HOST lives in ~/.zshrc / ~/.bashrc and would silently
+# disappear under a systemd --user timer.
 _detect_user_docker_host() {
+    if [[ -n ${CRON_DOCKER_HOST_FLAG:-} ]]; then
+        printf '%s' "$CRON_DOCKER_HOST_FLAG"
+        return 0
+    fi
     [[ -n ${DOCKER_HOST:-} ]] || return 0
     if systemctl --user show-environment 2>/dev/null | grep -q '^DOCKER_HOST='; then
         return 0
@@ -1022,10 +1037,15 @@ _systemd_user_backend_install() {
         fi
     done
 
-    local pinned_docker_host env_lines=""
+    local pinned_docker_host env_lines="" pin_source=""
     pinned_docker_host=$(_detect_user_docker_host)
     if [[ -n $pinned_docker_host ]]; then
         env_lines="Environment=DOCKER_HOST=${pinned_docker_host}"$'\n'
+        if [[ -n ${CRON_DOCKER_HOST_FLAG:-} ]]; then
+            pin_source="--docker-host flag"
+        else
+            pin_source="rootless docker detected"
+        fi
     fi
 
     local svc tmr
@@ -1039,7 +1059,7 @@ _systemd_user_backend_install() {
         printf '%s\n' "$tmr" | sed 's/^/    /'
         log "[dry-run] would: systemctl --user daemon-reload && systemctl --user enable --now hoist.timer"
         [[ -n $pinned_docker_host ]] && \
-            log "[dry-run] would pin DOCKER_HOST=${pinned_docker_host} (not in user systemd env)"
+            log "[dry-run] would pin DOCKER_HOST=${pinned_docker_host} (${pin_source})"
         return 0
     fi
 
@@ -1053,7 +1073,7 @@ _systemd_user_backend_install() {
     systemctl --user enable --now hoist.timer || return 1
     log "Installed user hoist.timer (OnCalendar=$on_calendar)"
     [[ -n $pinned_docker_host ]] && \
-        log "Pinned DOCKER_HOST=${pinned_docker_host} into hoist.service (rootless docker detected)"
+        log "Pinned DOCKER_HOST=${pinned_docker_host} into hoist.service (${pin_source})"
     log "Logs: journalctl --user -u hoist.service"
     if ! loginctl show-user "$USER" 2>/dev/null | grep -q "^Linger=yes"; then
         log "Tip: run 'loginctl enable-linger $USER' so the timer starts at boot without a login session"
@@ -1255,6 +1275,11 @@ _cron_install_orchestrate() {
     fi
 
     [[ -n $scope ]] || scope=$(_prompt_scope) || return 1
+
+    if [[ -n ${CRON_DOCKER_HOST_FLAG:-} && $scope != user ]]; then
+        log "Error: --docker-host is only supported with --scope user."
+        return 1
+    fi
 
     # ---- user scope: systemd --user only ----
     if [[ $scope == user ]]; then

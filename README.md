@@ -243,11 +243,18 @@ Hoist can install its own scheduled run on Linux:
 ```bash
 hoist --cron install                     # interactive: prompts for schedule, user, backend
 hoist --cron install --schedule hourly --user root --backend cron   # non-interactive
+hoist --cron install --scope user --schedule hourly \
+  --docker-host unix:///run/user/1000/docker.sock     # rootless docker, non-interactive
 hoist --cron status                      # show what's currently installed
 hoist --cron print                       # preview the file(s) that would be written
 hoist --cron remove                      # uninstall the hoist-managed schedule
 hoist --cron                             # interactive menu
 ```
+
+For user-scope installs, hoist auto-pins `DOCKER_HOST` into the generated unit
+when rootless docker is detected. Pass `--docker-host <uri>` to override
+auto-detect (useful for non-interactive automation where `DOCKER_HOST` isn't
+set in the calling shell).
 
 `--cron install` auto-detects systemd vs. cron and writes either `/etc/cron.d/hoist`
 or a `hoist.service` + `hoist.timer` pair in `/etc/systemd/system/`. Files carry a

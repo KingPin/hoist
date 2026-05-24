@@ -24,7 +24,7 @@ bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>] [--list] [--update]
 - `--parallel N` uses `xargs -P N` to process containers concurrently
 - `--list` / `--status` prints a table of running containers + their hoist labels and cached digest, then exits before any pulls
 - `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--version` prints `HOIST_VERSION` and exits
-- `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and, for system scope, `--user <name>` (and `--backend cron|systemd` if both are present). Non-root users are also asked `--scope user|system`; root always defaults to system scope.
+- `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and, for system scope, `--user <name>` (and `--backend cron|systemd` if both are present). Non-root users are also asked `--scope user|system`; root always defaults to system scope. `--docker-host <uri>` is an optional override for user-scope installs that pins `DOCKER_HOST` into the generated unit (use when the calling shell doesn't have `DOCKER_HOST` set, or to override auto-detect).
 
 ## Architecture
 
@@ -115,6 +115,7 @@ Two scopes, chosen via `--scope user|system` (non-root users are prompted; root 
   - Enabled with `systemctl --user enable --now hoist.timer`.
   - After install, hoist suggests `loginctl enable-linger $USER` if linger is not already set (needed for the timer to survive without an active login session).
   - **Rootless docker auto-pin**: at install time, `_detect_user_docker_host` checks whether `DOCKER_HOST` is set in the caller's env, *not* already exported into `systemctl --user show-environment`, and no docker context is steering the connection (`docker context show` == `default`). If all three are true, the install bakes `Environment=DOCKER_HOST=<value>` into `hoist.service` so the timer-fired run matches the user's interactive shell. Context-based rootless setups need nothing — they already work via `~/.docker/config.json`.
+  - **Explicit `--docker-host <uri>`** wins over auto-detect. Use when `DOCKER_HOST` isn't set in the calling shell (non-interactive automation, Ansible) or when auto-detect would pick the wrong socket. Only valid with `--scope user`; passing it with system scope errors out. Source is logged as `--docker-host flag` vs `rootless docker detected` so install logs make the origin obvious.
   - If systemd is not available and `--scope user` is requested, hoist prints cron setup instructions and optionally generates the `/etc/cron.d/hoist` file for the user to place manually.
 
 Non-interactive contract: `install` needs `--schedule` (preset `30min|hourly|6hourly|daily|weekly` or a raw cron / `OnCalendar` expression). System scope also requires `--user`. Non-root callers additionally need `--scope`. If any required value is missing and stdin isn't a TTY, hoist prints a clear error and exits — it never hangs waiting for input.

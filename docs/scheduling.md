@@ -21,6 +21,7 @@ automatically).
 | `hoist --cron` | Interactive menu (install / remove / print / status / cancel) |
 | `hoist --cron install` | Detect scheduler, prompt, write files, enable |
 | `hoist --cron install --schedule hourly --user root --backend cron` | Fully non-interactive install |
+| `hoist --cron install --scope user --schedule hourly --docker-host unix:///run/user/1000/docker.sock` | Non-interactive user-scope install with an explicit rootless docker socket |
 | `hoist --cron remove` | Uninstall hoist-managed schedule (idempotent) |
 | `hoist --cron print` | Print files that *would* be written (no changes) |
 | `hoist --cron status` | Show what's currently installed; exit 1 if nothing |
@@ -112,6 +113,37 @@ systemctl list-timers hoist.timer
 systemctl status hoist.service
 journalctl -u hoist.service
 ```
+
+---
+
+## User scope and rootless docker
+
+`--scope user` writes `~/.config/systemd/user/hoist.{service,timer}` and enables
+them with `systemctl --user`. No sudo, no system units. Run
+`loginctl enable-linger $USER` if you want the timer to fire when you're not
+logged in.
+
+Rootless docker normally exposes its socket at
+`unix:///run/user/$(id -u)/docker.sock` and surfaces it to interactive shells
+via `DOCKER_HOST` in `~/.bashrc` / `~/.zshrc`. A systemd `--user` timer does
+not inherit that — so hoist handles it two ways:
+
+- **Auto-pin**: if `DOCKER_HOST` is set in the shell where you run
+  `hoist --cron install`, *and* it's not already in `systemctl --user
+  show-environment`, *and* no docker context is steering the connection,
+  hoist bakes `Environment=DOCKER_HOST=<value>` into the generated
+  `hoist.service`.
+- **Explicit `--docker-host <uri>`**: overrides auto-detect. Useful when
+  `DOCKER_HOST` isn't set in the calling shell (Ansible, CI, scripted
+  installs) or auto-detect would pick the wrong socket.
+
+```bash
+hoist --cron install --scope user --schedule hourly \
+  --docker-host unix:///run/user/1000/docker.sock
+```
+
+`--docker-host` is rejected with system scope — the system unit doesn't go
+through this path.
 
 ---
 
