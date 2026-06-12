@@ -216,7 +216,15 @@ trap '_jobs=$(jobs -p); [[ -n "$_jobs" ]] && kill $_jobs 2>/dev/null; exit 130' 
 
 if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
+    # jq is mandatory for label inspection on every non-cron run; fail early with
+    # an actionable message rather than mid-run with a cryptic parse error.
+    command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but was not found in PATH. Install jq and retry." >&2; exit 1; }
 fi
+
+# Tolerate whitespace in the rollup channel list (e.g. "discord, slack"): both
+# the membership test and the dispatch loop match on exact comma-delimited
+# tokens, so strip spaces/tabs once here.
+WEBHOOK_ROLLUP_CHANNELS="${WEBHOOK_ROLLUP_CHANNELS//[[:space:]]/}"
 
 for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOOK \
                GLOBAL_GOTIFY_URL GLOBAL_NTFY_URL GLOBAL_TEAMS_WEBHOOK \
@@ -2033,9 +2041,15 @@ process_container() {
 
     if [[ -n $docker_compose_version ]] && { _is_true "$hoist_update" || _is_true "$hoist_notify"; }; then
         if [[ -n $docker_compose_workdir && -n $docker_compose_service ]]; then
+            # Hash the (workdir, service) identity rather than sanitizing it with
+            # tr: the old `tr -cs` collapsed every non-alnum run to a single '_',
+            # so distinct projects (e.g. /srv/a-b vs /srv/a/b) could collide on the
+            # same key and wrongly dedup each other. The compose workdir already
+            # encodes the project, so this pair is the replica identity. cksum is a
+            # coreutils builtin (no extra dependency).
             local _dedup_key
-            _dedup_key=$(printf '%s:%s' "$docker_compose_workdir" "$docker_compose_service" \
-                | tr -cs '[:alnum:]._-' '_')
+            _dedup_key=$(printf '%s:%s' "$docker_compose_workdir" "$docker_compose_service" | cksum)
+            _dedup_key=${_dedup_key// /_}
             if ! mkdir "${CACHE_LOCATION}/hoist-compose-${_dedup_key}.deduped" 2>/dev/null; then
                 [[ $VERBOSE == true ]] && log "$container_name: replica of '$docker_compose_service' already processed this run — skipping"
                 return 0
@@ -2053,11 +2067,16 @@ process_container() {
             elif [[ -f "$hoist_registry_authfile" ]]; then
                 log "$container_name: Registry login..."
                 if [[ $DRY_RUN != true ]]; then
-                    jq -r .password < "$hoist_registry_authfile" | \
-                        "${DOCKER_BINARY}" login \
-                            --username "$(jq -r .username < "$hoist_registry_authfile")" \
-                            --password-stdin \
-                            "$(jq -r .registry < "$hoist_registry_authfile")"
+                    local _auth_user _auth_pass _auth_reg
+                    _auth_user=$(jq -r '.username // ""' < "$hoist_registry_authfile")
+                    _auth_pass=$(jq -r '.password // ""' < "$hoist_registry_authfile")
+                    _auth_reg=$(jq -r '.registry // ""' < "$hoist_registry_authfile")
+                    if [[ -z $_auth_user || -z $_auth_pass || -z $_auth_reg ]]; then
+                        log "$container_name: registry login skipped — authfile missing username, password, or registry"
+                    elif ! printf '%s' "$_auth_pass" | "${DOCKER_BINARY}" login \
+                            --username "$_auth_user" --password-stdin "$_auth_reg" >/dev/null 2>&1; then
+                        log "$container_name: registry login failed for $_auth_reg"
+                    fi
                 fi
             fi
         fi
