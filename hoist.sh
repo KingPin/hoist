@@ -59,6 +59,11 @@ _load_config() {
     fi
     [[ -n $cfg ]] && { log "Loading config: $cfg"; source "$cfg"; }
 }
+
+# All startup side effects (config load, arg parsing, environment validation,
+# trap install) live in _init so the script can be sourced by tests without
+# executing anything. _init is invoked from the entry-point guard at the bottom.
+_init() {
 _load_config
 
 while [[ "$1" != "" ]]; do
@@ -193,6 +198,7 @@ for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOO
 done
 
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
+}
 
 setup_environment() {
     # Exported so external child processes (user script.update / script.notify hooks,
@@ -2182,6 +2188,8 @@ list_containers() {
     done
 }
 
+# The main run sequence; invoked from the entry-point guard at the bottom.
+_main() {
 if [[ $DO_CRON == true ]]; then
     _cron_dispatch
 fi
@@ -2271,4 +2279,12 @@ if grep -Elq '^(update_failed|unhealthy|rollback_failed)$' "${CACHE_LOCATION}"/h
     _hc_ping fail
 else
     _hc_ping
+fi
+}
+
+# Entry point: run only when executed directly, not when sourced (e.g. by the
+# bats test suite, which sources this file to exercise pure functions).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    _init "$@"
+    _main
 fi
