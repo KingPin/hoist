@@ -1873,9 +1873,16 @@ process_container() {
     local hoist_registry_authfile
     local -a hoist_script_update hoist_script_notify
 
-    local _jq_out
-    _jq_out=$(jq -r --arg tag "$TAG" '
+    # NUL-delimited fields read via process substitution: an embedded newline in
+    # any label value cannot shift the field-to-index mapping below, and (unlike
+    # $(...) capture) a real pipe preserves the NUL separators. A trailing NUL is
+    # appended so an empty final field is still counted. jq failure or a malformed
+    # inspect yields the wrong field count, which the guard below treats as a
+    # parse error.
+    local _vals
+    readarray -d '' -t _vals < <(jq -j --arg tag "$TAG" '
         .[0] |
+        [
         .Config.Image,
         .Image,
         (.Config.Labels["com.docker.compose.service"] // ""),
@@ -1906,13 +1913,14 @@ process_container() {
         (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.wait"]    // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).healthcheck.timeout"] // ""),
         (.Config.Labels["com.sumguy.hoist\($tag).rollback"]            // "")
-    ' <<< "$inspect") || {
+        ] | map(. + "\u0000") | add
+    ' <<< "$inspect")
+    if [[ ${#_vals[@]} -ne 30 ]]; then
         log "$container_name: failed to parse inspect output"
         _tokens+=("update_failed")
         printf '%s\n' "${_tokens[@]}" >> "$_result_file"
         return 1
-    }
-    readarray -t _vals <<< "$_jq_out"
+    fi
 
     image_name="${_vals[0]}"
     container_image_digest="${_vals[1]}"
@@ -2296,20 +2304,24 @@ list_containers() {
             continue
         }
 
-        local _jq_out
-        _jq_out=$(jq -r --arg tag "$TAG" '
+        local _lv
+        # NUL-delimited via process substitution; $() would strip the NULs.
+        # A wrong field count (jq failure / malformed inspect) is the error signal.
+        readarray -d '' -t _lv < <(jq -j --arg tag "$TAG" '
             .[0] |
+            [
             .Config.Image,
             (.Config.Labels["com.sumguy.hoist\($tag).update"] // .Config.Labels["org.hotio.pullio\($tag).update"] // ""),
             (.Config.Labels["com.sumguy.hoist\($tag).notify"] // .Config.Labels["org.hotio.pullio\($tag).notify"] // ""),
             (.Config.Labels["com.sumguy.hoist\($tag).pause_until"] // ""),
             (.Config.Labels["com.sumguy.hoist\($tag).constraint"] // ""),
             (.Config.Labels["com.sumguy.hoist\($tag).group"] // "")
-        ' <<< "$inspect") || {
+            ] | map(. + "\u0000") | add
+        ' <<< "$inspect")
+        if [[ ${#_lv[@]} -ne 6 ]]; then
             printf '%-20s %-32s %-7s %-7s %-18s %s\n' "$container_name" "(parse failed)" "-" "-" "-" "-"
             continue
-        }
-        readarray -t _lv <<< "$_jq_out"
+        fi
 
         local image="${_lv[0]}" update_label="${_lv[1]}" notify_label="${_lv[2]}"
         local pause_label="${_lv[3]}" constraint_label="${_lv[4]}" group_label="${_lv[5]}"
