@@ -51,6 +51,14 @@ log() {
     [[ -n $LOG_FILE ]] && echo "$msg" >> "$LOG_FILE"
 }
 
+# _normalize_tag <tag>  -> echoes the tag with a guaranteed leading dot (or
+# empty for empty input). Labels are read as com.sumguy.hoist<TAG>.<key>.
+_normalize_tag() {
+    local t="$1"
+    [[ -n $t && $t != .* ]] && t=".$t"
+    printf '%s' "$t"
+}
+
 _load_config() {
     local cfg=""
     if   [[ -n $HOIST_CONFIG && -f $HOIST_CONFIG ]];   then cfg="$HOIST_CONFIG"
@@ -70,10 +78,14 @@ while [[ "$1" != "" ]]; do
     case "$1" in
     --dry-run)    DRY_RUN=true; VERBOSE=true ;;
     --verbose)    VERBOSE=true ;;
-    --tag=*)      val="${1#*=}"; [[ -n $val ]] && TAG=".$val" ;;
-    --tag)        shift; [[ -n "$1" && "$1" != "--"* ]] && TAG=".$1" ;;
-    --parallel=*) val="${1#*=}"; [[ $val =~ ^[0-9]+$ ]] && PARALLEL=$val ;;
-    --parallel)   shift; [[ "$1" =~ ^[0-9]+$ ]] && PARALLEL="$1" ;;
+    --tag=*)      TAG="${1#*=}"
+                  [[ -n $TAG ]] || { echo "Error: --tag requires a value" >&2; exit 2; } ;;
+    --tag)        [[ -n ${2:-} && $2 != --* ]] || { echo "Error: --tag requires a value" >&2; exit 2; }
+                  TAG="$2"; shift ;;
+    --parallel=*) PARALLEL="${1#*=}"
+                  [[ $PARALLEL =~ ^[0-9]+$ ]] || { echo "Error: --parallel requires a non-negative integer" >&2; exit 2; } ;;
+    --parallel)   [[ -n ${2:-} && $2 =~ ^[0-9]+$ ]] || { echo "Error: --parallel requires a non-negative integer" >&2; exit 2; }
+                  PARALLEL="$2"; shift ;;
     --update)     DO_SELF_UPDATE=true ;;
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
@@ -165,9 +177,17 @@ Config file (sourced before CLI flag parsing):
 Repo: https://github.com/${HOIST_REPO}
 EOF
         exit 0 ;;
+    *)  echo "Error: unknown option: $1" >&2
+        echo "Run 'hoist --help' for usage." >&2
+        exit 2 ;;
     esac
     shift
 done
+
+# Normalize TAG: labels are read as com.sumguy.hoist<TAG>.<key>, so a non-empty
+# TAG must carry its leading dot. Accepts both `--tag nightly` (CLI) and
+# `TAG=nightly` (config / Ansible).
+TAG="$(_normalize_tag "$TAG")"
 
 # Bash 4.3+ check runs after arg parse so --version/--help still work on macOS
 # system bash 3.2 — users need a way to diagnose what they have installed.
