@@ -1965,11 +1965,29 @@ _dispatch_notification() {
     "$@"
 }
 
+# _sanitize_name <out-var> <input>
+# Map <input> to a cache-safe token: every run of characters outside
+# [alnum._-] collapses to a single underscore. Replaces the previous
+# `tr -cs '[:alnum:]._-' '_'` (replace + squeeze, including squeezing
+# underscores adjacent to a replacement) without forking tr in the
+# per-container hot path; writes the result to the named variable.
+# Note: unlike C-locale tr, bash's [:alnum:] honors the current locale, so a
+# non-ASCII byte is kept rather than replaced. That never affects the
+# persistent state file — Docker container names are ASCII-only — and group
+# flags stay internally consistent because the same helper writes and reads
+# them within a run.
+_sanitize_name() {
+    local -n __san_out="$1"
+    local __san_s="${2//[^[:alnum:]._-]/_}"
+    while [[ $__san_s == *__* ]]; do __san_s="${__san_s//__/_}"; done
+    __san_out="$__san_s"
+}
+
 # write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
 write_rollup_entry() {
     [[ $WEBHOOK_ROLLUP == true ]] || return 0
     local safe
-    safe=$(printf '%s' "$2" | tr -cs '[:alnum:]._-' '_')
+    _sanitize_name safe "$2"
     _state_path_safe "${CACHE_LOCATION}/hoist-${safe}.rollup" || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" \
         > "${CACHE_LOCATION}/hoist-${safe}.rollup"
@@ -2041,7 +2059,7 @@ send_rollup_notifications() {
 process_container() {
     local container_name="$1"
     local safe_name
-    safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
+    _sanitize_name safe_name "$container_name"
     local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
     # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
     _state_path_safe "$_result_file" || return 1
@@ -2240,7 +2258,7 @@ process_container() {
                 log "$container_name: Pull failed"
                 if [[ -n $hoist_group ]]; then
                     local _g_safe
-                    _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+                    _sanitize_name _g_safe "$hoist_group"
                     _state_path_safe "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" \
                         && : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
                 fi
@@ -2299,7 +2317,7 @@ process_container() {
         local _group_aborted=false
         if [[ -n $hoist_group ]]; then
             local _g_safe
-            _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
+            _sanitize_name _g_safe "$hoist_group"
             if [[ -f "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" ]]; then
                 log "$container_name: group '$hoist_group' has a failed peer — aborting update"
                 _group_aborted=true
@@ -2569,7 +2587,7 @@ list_containers() {
         fi
 
         local safe_name
-        safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
+        _sanitize_name safe_name "$container_name"
         local raw_digest
         raw_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
         if [[ -n $raw_digest ]]; then
