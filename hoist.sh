@@ -51,6 +51,16 @@ log() {
     [[ -n $LOG_FILE ]] && echo "$msg" >> "$LOG_FILE"
 }
 
+# _is_true <value>  -> 0 if the value is an affirmative boolean, else 1.
+# Case-insensitive; accepts true/1/yes/on. Used for user-supplied label and
+# config gates so "True", "YES", "1" behave the same as "true".
+_is_true() {
+    case "${1,,}" in
+        true|1|yes|on) return 0 ;;
+        *)             return 1 ;;
+    esac
+}
+
 # _normalize_tag <tag>  -> echoes the tag with a guaranteed leading dot (or
 # empty for empty input). Labels are read as com.sumguy.hoist<TAG>.<key>.
 _normalize_tag() {
@@ -1916,7 +1926,7 @@ process_container() {
         }
     fi
 
-    if [[ -n $docker_compose_version && ($hoist_update == true || $hoist_notify == true) ]]; then
+    if [[ -n $docker_compose_version ]] && { _is_true "$hoist_update" || _is_true "$hoist_notify"; }; then
         if [[ -n $docker_compose_workdir && -n $docker_compose_service ]]; then
             local _dedup_key
             _dedup_key=$(printf '%s:%s' "$docker_compose_workdir" "$docker_compose_service" \
@@ -1951,8 +1961,8 @@ process_container() {
         if [[ $DRY_RUN == true ]]; then
             log "$container_name: [dry-run] would pull image"
             image_digest="$container_image_digest"
-            [[ $hoist_update == true ]] && _tokens+=("would_update")
-            [[ $hoist_notify == true ]] && _tokens+=("would_notify")
+            _is_true "$hoist_update" && _tokens+=("would_update")
+            _is_true "$hoist_notify" && _tokens+=("would_notify")
         else
             log "$container_name: Pulling image..."
             compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
@@ -2015,8 +2025,8 @@ process_container() {
             fi
         fi
 
-        if [[ $image_digest != "$container_image_digest" && $hoist_update == true \
-              && $_constraint_blocked != true && $_group_aborted != true ]]; then
+        if [[ $image_digest != "$container_image_digest" && $_constraint_blocked != true && $_group_aborted != true ]] \
+           && _is_true "$hoist_update"; then
             if [[ $DRY_RUN == true ]]; then
                 log "$container_name: [dry-run] would update container"
             else
@@ -2038,14 +2048,14 @@ process_container() {
                 fi
                 log "$container_name: Updating container..."
                 local _rollback_enabled=false
-                if [[ $hoist_rollback == true ]] || [[ -z $hoist_rollback && $ROLLBACK_DEFAULT == true ]]; then
+                if _is_true "$hoist_rollback" || { [[ -z $hoist_rollback ]] && _is_true "$ROLLBACK_DEFAULT"; }; then
                     _rollback_enabled=true
                 fi
                 local _hc_timeout="${hoist_healthcheck_timeout:-$HEALTHCHECK_TIMEOUT}"
                 local _update_ok=false _hc_ok=true
                 if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
                     _update_ok=true
-                    if [[ $hoist_healthcheck_wait == true ]]; then
+                    if _is_true "$hoist_healthcheck_wait"; then
                         log "$container_name: Waiting up to ${_hc_timeout}s for healthy..."
                         if ! _wait_for_healthy "$container_name" "$_hc_timeout"; then
                             _hc_ok=false
@@ -2085,7 +2095,7 @@ process_container() {
             fi
         fi
 
-        if [[ $image_digest != "$container_image_digest" && $hoist_notify == true && $DRY_RUN != true ]]; then
+        if [[ $image_digest != "$container_image_digest" && $DRY_RUN != true ]] && _is_true "$hoist_notify"; then
             local notified_digest
             notified_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
             if [[ $notified_digest != "$image_digest" ]]; then
@@ -2236,8 +2246,8 @@ list_containers() {
             update_col="-"
             notify_col="-"
         else
-            [[ $update_label == true ]] && update_col="yes" || update_col="no"
-            [[ $notify_label == true ]] && notify_col="yes" || notify_col="no"
+            _is_true "$update_label" && update_col="yes" || update_col="no"
+            _is_true "$notify_label" && notify_col="yes" || notify_col="no"
         fi
 
         local _policy_parts=()
