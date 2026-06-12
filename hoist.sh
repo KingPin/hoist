@@ -2056,35 +2056,25 @@ send_rollup_notifications() {
     done
 }
 
-process_container() {
-    local container_name="$1"
-    local safe_name
-    _sanitize_name safe_name "$container_name"
-    local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
-    # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
-    _state_path_safe "$_result_file" || return 1
-    local -a _tokens=()
-    log "$container_name: Checking..."
+# --- process_container helpers --------------------------------------------
+# These run inside process_container's frame and reach its locals (container_name,
+# the metadata fields, _tokens, status/color, …) through bash's dynamic scope —
+# the same mechanism the parallel worker pool and _dispatch_notification already
+# rely on. Each helper appends outcome tokens to the caller's _tokens array;
+# process_container alone owns the result-file write and the early returns. The
+# split keeps the 30-field parse, the pull/compare, the policy gate, the update,
+# and the notify dispatch independently readable without threading ~40 values
+# through argument lists.
 
+# Inspect the container and populate every metadata + effective_* local in the
+# caller. Appends update_failed and returns 1 on inspect or parse failure.
+_get_container_metadata() {
     local inspect
     inspect=$("${DOCKER_BINARY}" inspect "$container_name") || {
         log "$container_name: inspect failed"
         _tokens+=("update_failed")
-        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
         return 1
     }
-
-    local image_name container_image_digest
-    local docker_compose_service docker_compose_version docker_compose_workdir
-    local old_oci_version old_oci_revision
-    local hoist_update hoist_notify hoist_discord_webhook hoist_generic_webhook hoist_slack_webhook
-    local hoist_telegram_bot_token hoist_telegram_chat_id
-    local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
-    local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
-    local hoist_pause_until hoist_constraint hoist_group
-    local hoist_healthcheck_wait hoist_healthcheck_timeout hoist_rollback
-    local hoist_registry_authfile
-    local -a hoist_script_update hoist_script_notify
 
     # NUL-delimited fields read via process substitution: an embedded newline in
     # any label value cannot shift the field-to-index mapping below, and (unlike
@@ -2131,7 +2121,6 @@ process_container() {
     if [[ ${#_vals[@]} -ne 30 ]]; then
         log "$container_name: failed to parse inspect output"
         _tokens+=("update_failed")
-        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
         return 1
     fi
 
@@ -2166,18 +2155,18 @@ process_container() {
     hoist_healthcheck_timeout="${_vals[28]}"
     hoist_rollback="${_vals[29]}"
 
-    local effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
-    local effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
-    local effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
-    local effective_telegram_bot_token="${hoist_telegram_bot_token:-$GLOBAL_TELEGRAM_BOT_TOKEN}"
-    local effective_telegram_chat_id="${hoist_telegram_chat_id:-$GLOBAL_TELEGRAM_CHAT_ID}"
-    local effective_gotify_url="${hoist_gotify_url:-$GLOBAL_GOTIFY_URL}"
-    local effective_ntfy_url="${hoist_ntfy_url:-$GLOBAL_NTFY_URL}"
-    local effective_ntfy_token="${hoist_ntfy_token:-$GLOBAL_NTFY_TOKEN}"
-    local effective_teams_webhook="${hoist_teams_webhook:-$GLOBAL_TEAMS_WEBHOOK}"
-    local effective_matrix_homeserver="${hoist_matrix_homeserver:-$GLOBAL_MATRIX_HOMESERVER}"
-    local effective_matrix_room_id="${hoist_matrix_room_id:-$GLOBAL_MATRIX_ROOM_ID}"
-    local effective_matrix_token="${hoist_matrix_token:-$GLOBAL_MATRIX_TOKEN}"
+    effective_discord="${hoist_discord_webhook:-$GLOBAL_DISCORD_WEBHOOK}"
+    effective_generic="${hoist_generic_webhook:-$GLOBAL_GENERIC_WEBHOOK}"
+    effective_slack="${hoist_slack_webhook:-$GLOBAL_SLACK_WEBHOOK}"
+    effective_telegram_bot_token="${hoist_telegram_bot_token:-$GLOBAL_TELEGRAM_BOT_TOKEN}"
+    effective_telegram_chat_id="${hoist_telegram_chat_id:-$GLOBAL_TELEGRAM_CHAT_ID}"
+    effective_gotify_url="${hoist_gotify_url:-$GLOBAL_GOTIFY_URL}"
+    effective_ntfy_url="${hoist_ntfy_url:-$GLOBAL_NTFY_URL}"
+    effective_ntfy_token="${hoist_ntfy_token:-$GLOBAL_NTFY_TOKEN}"
+    effective_teams_webhook="${hoist_teams_webhook:-$GLOBAL_TEAMS_WEBHOOK}"
+    effective_matrix_homeserver="${hoist_matrix_homeserver:-$GLOBAL_MATRIX_HOMESERVER}"
+    effective_matrix_room_id="${hoist_matrix_room_id:-$GLOBAL_MATRIX_ROOM_ID}"
+    effective_matrix_token="${hoist_matrix_token:-$GLOBAL_MATRIX_TOKEN}"
     if [[ -n "${hoist_script_update[0]}" ]]; then
         validate_script_path "${hoist_script_update[0]}" || {
             log "$container_name: script.update label rejected; skipping"
@@ -2189,6 +2178,320 @@ process_container() {
             log "$container_name: script.notify label rejected; skipping"
             hoist_script_notify=()
         }
+    fi
+    return 0
+}
+
+# Log in to the container's private registry if a valid authfile label is set.
+# Side-effect only (docker login); never fails the run.
+_registry_login() {
+    [[ -n "$hoist_registry_authfile" ]] || return 0
+    if [[ "$hoist_registry_authfile" != /* ]]; then
+        log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
+        return 0
+    fi
+    [[ -f "$hoist_registry_authfile" ]] || return 0
+    # The authfile holds a plaintext registry password; warn loudly if it's
+    # readable beyond its owner so a misconfigured 0644 file doesn't leak
+    # credentials to every local user unnoticed.
+    local _auth_perm
+    _auth_perm=$(stat -c '%a' "$hoist_registry_authfile" 2>/dev/null \
+        || stat -f '%Lp' "$hoist_registry_authfile" 2>/dev/null)
+    if [[ -n $_auth_perm && $(( 8#$_auth_perm & 0077 )) -ne 0 ]]; then
+        log "$container_name: Warning: authfile $hoist_registry_authfile is group/world-accessible (mode $_auth_perm) — chmod 600 it"
+    fi
+    log "$container_name: Registry login..."
+    [[ $DRY_RUN != true ]] || return 0
+    local _auth_user _auth_pass _auth_reg
+    _auth_user=$(jq -r '.username // ""' < "$hoist_registry_authfile")
+    _auth_pass=$(jq -r '.password // ""' < "$hoist_registry_authfile")
+    _auth_reg=$(jq -r '.registry // ""' < "$hoist_registry_authfile")
+    if [[ -z $_auth_user || -z $_auth_pass || -z $_auth_reg ]]; then
+        log "$container_name: registry login skipped — authfile missing username, password, or registry"
+    elif ! printf '%s' "$_auth_pass" | "${DOCKER_BINARY}" login \
+            --username "$_auth_user" --password-stdin "$_auth_reg" >/dev/null 2>&1; then
+        log "$container_name: registry login failed for $_auth_reg"
+    fi
+    return 0
+}
+
+# Pull the image and resolve the new digest + OCI version/revision into the
+# caller's image_digest/new_oci_* locals. In dry-run, reports eligibility tokens
+# without pulling. Appends update_failed and returns 1 on any pull/inspect error.
+_pull_and_compare_digest() {
+    if [[ $DRY_RUN == true ]]; then
+        # Read-only: do not pull (a pull would re-point the tag and demote
+        # the running image to dangling). We therefore can't compare digests
+        # — report eligibility (configured + not paused) rather than claiming
+        # an update is available.
+        log "$container_name: [dry-run] eligible — a live run would pull and check for an update"
+        image_digest="$container_image_digest"
+        _is_true "$hoist_update" && _tokens+=("would_update")
+        _is_true "$hoist_notify" && _tokens+=("would_notify")
+        return 0
+    fi
+
+    log "$container_name: Pulling image..."
+    compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
+        log "$container_name: Pull failed"
+        if [[ -n $hoist_group ]]; then
+            local _g_safe
+            _sanitize_name _g_safe "$hoist_group"
+            _state_path_safe "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" \
+                && : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
+        fi
+        _tokens+=("update_failed")
+        return 1
+    }
+
+    local image_inspect _img_out _img
+    image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name" 2>/dev/null) || {
+        log "$container_name: docker image inspect failed for $image_name (image missing after pull?)"
+        _tokens+=("update_failed")
+        return 1
+    }
+    _img_out=$(jq -r '
+        .[0] |
+        .Id,
+        (.Config.Labels["org.opencontainers.image.version"] // ""),
+        (.Config.Labels["org.opencontainers.image.revision"] // "")
+    ' <<< "$image_inspect") || {
+        log "$container_name: failed to parse image inspect output"
+        _tokens+=("update_failed")
+        return 1
+    }
+    readarray -t _img <<< "$_img_out"
+    image_digest="${_img[0]}"
+    new_oci_version="${_img[1]}"
+    new_oci_revision="${_img[2]}"
+    # docker prints `[]` for a missing image, so jq succeeds with a null
+    # .Id — guard against an empty digest before any compare/update.
+    if [[ -z $image_digest || $image_digest == null ]]; then
+        log "$container_name: image inspect returned no image ID for $image_name"
+        _tokens+=("update_failed")
+        return 1
+    fi
+    return 0
+}
+
+# Apply read-only policy gates (constraint pin, group abort) to the resolved
+# new version. Seeds status/status_generic/color and sets _constraint_blocked /
+# _group_aborted in the caller; appends the matching block token.
+_evaluate_policies() {
+    status="🔄 Update available"; status_generic="update_available"; color=3447003
+
+    # Constraint check: if violated, block update but still allow notify
+    _constraint_blocked=false
+    if [[ -n $hoist_constraint && -n $new_oci_version ]] \
+       && ! _semver_satisfies "$hoist_constraint" "$new_oci_version"; then
+        log "$container_name: constraint '$hoist_constraint' violated by version '$new_oci_version' — blocking update"
+        _constraint_blocked=true
+        _tokens+=("constraint_blocked")
+        status="🔒 Update blocked by constraint ${hoist_constraint} (image=${new_oci_version})"
+        status_generic="update_blocked"
+        color=15105570
+    fi
+
+    # Group abort: if any peer in the same group already failed to pull, skip update
+    _group_aborted=false
+    if [[ -n $hoist_group ]]; then
+        local _g_safe
+        _sanitize_name _g_safe "$hoist_group"
+        if [[ -f "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" ]]; then
+            log "$container_name: group '$hoist_group' has a failed peer — aborting update"
+            _group_aborted=true
+            _tokens+=("group_aborted")
+            status="🚫 Update aborted (group '${hoist_group}' had a failed peer)"
+            status_generic="update_aborted"
+            color=15105570
+        fi
+    fi
+}
+
+# Recreate the container when the digest changed and no policy blocked it. Runs
+# the optional update script, compose up, the healthcheck wait, and rollback on
+# failure; appends updated / unhealthy / update_failed / rolled_back /
+# rollback_failed and updates status/color for the notification.
+_apply_update() {
+    { [[ $image_digest != "$container_image_digest" && $_constraint_blocked != true && $_group_aborted != true ]] \
+        && _is_true "$hoist_update"; } || return 0
+    if [[ $DRY_RUN == true ]]; then
+        log "$container_name: [dry-run] would update container"
+        return 0
+    fi
+    if [[ -n "${hoist_script_update[*]}" ]]; then
+        log "$container_name: Stopping container..."
+        "${DOCKER_BINARY}" stop "$container_name"
+        log "$container_name: Executing update script..."
+        export HOIST_CONTAINER="$container_name"
+        export HOIST_IMAGE="$image_name"
+        export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
+        export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
+        export HOIST_OLD_VERSION="$old_oci_version"
+        export HOIST_NEW_VERSION="$new_oci_version"
+        export HOIST_OLD_REVISION="$old_oci_revision"
+        export HOIST_NEW_REVISION="$new_oci_revision"
+        export HOIST_COMPOSE_SERVICE="$docker_compose_service"
+        export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
+        "${hoist_script_update[@]}"
+    fi
+    log "$container_name: Updating container..."
+    local _rollback_enabled=false
+    if _is_true "$hoist_rollback" || { [[ -z $hoist_rollback ]] && _is_true "$ROLLBACK_DEFAULT"; }; then
+        _rollback_enabled=true
+    fi
+    local _hc_timeout="${hoist_healthcheck_timeout:-$HEALTHCHECK_TIMEOUT}"
+    local _update_ok=false _hc_ok=true
+    if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
+        _update_ok=true
+        if _is_true "$hoist_healthcheck_wait"; then
+            log "$container_name: Waiting up to ${_hc_timeout}s for healthy..."
+            if ! _wait_for_healthy "$container_name" "$_hc_timeout"; then
+                _hc_ok=false
+                log "$container_name: container failed healthcheck after update"
+            fi
+        fi
+    fi
+
+    if [[ $_update_ok == true && $_hc_ok == true ]]; then
+        status="✅ Update succeeded"
+        status_generic="update_success"
+        color=3066993
+        _tokens+=("updated")
+    else
+        if [[ $_update_ok == true && $_hc_ok != true ]]; then
+            status="❌ Update unhealthy"
+            status_generic="update_failure"
+            _tokens+=("unhealthy")
+        else
+            log "$container_name: Update failed"
+            status="❌ Update failed"
+            status_generic="update_failure"
+            _tokens+=("update_failed")
+        fi
+        color=15158332
+        if [[ $_rollback_enabled == true ]]; then
+            if _rollback_container "$container_name" "$docker_compose_workdir" "$docker_compose_service" "$image_name" "$container_image_digest"; then
+                _tokens+=("rolled_back")
+                status+=" (rolled back)"
+            else
+                _tokens+=("rollback_failed")
+                status+=" (rollback failed)"
+            fi
+        fi
+    fi
+    rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
+}
+
+# Send the per-channel notifications when the digest changed, notify is on, and
+# this image version hasn't been notified before. Runs the optional notify
+# script, fans out to every configured channel via _dispatch_notification,
+# records the rollup entry, and persists the dedup digest.
+_dispatch_notifications() {
+    { [[ $image_digest != "$container_image_digest" && $DRY_RUN != true ]] && _is_true "$hoist_notify"; } || return 0
+    local notified_digest
+    notified_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
+    [[ $notified_digest == "$image_digest" ]] && return 0
+
+    if [[ -n "${hoist_script_notify[*]}" ]]; then
+        log "$container_name: Executing notify script..."
+        export HOIST_CONTAINER="$container_name"
+        export HOIST_IMAGE="$image_name"
+        export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
+        export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
+        export HOIST_OLD_VERSION="$old_oci_version"
+        export HOIST_NEW_VERSION="$new_oci_version"
+        export HOIST_OLD_REVISION="$old_oci_revision"
+        export HOIST_NEW_REVISION="$new_oci_revision"
+        export HOIST_COMPOSE_SERVICE="$docker_compose_service"
+        export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
+        "${hoist_script_notify[@]}"
+    fi
+    local _slack_msg="[$container_name] $status: $image_name"
+    # Per-channel dispatch: each block gates on credential presence,
+    # then _dispatch_notification applies the rollup-skip check and
+    # the standard log line. Senders' signatures differ too much for
+    # a string-keyed table to hold them, so the credential guards
+    # stay inline and readable.
+    if [[ -n $effective_discord ]]; then
+        _dispatch_notification discord Discord \
+            send_discord_notification "$status" "$container_name" \
+            "$old_oci_version" "$new_oci_version" "$image_name" \
+            "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
+            "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
+    fi
+    if [[ -n $effective_generic ]]; then
+        _dispatch_notification generic "generic webhook" \
+            send_generic_webhook "$status_generic" "$container_name" \
+            "$old_oci_version" "$new_oci_version" "$image_name" \
+            "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
+            "${container_image_digest#sha256:}" "${image_digest#sha256:}"
+    fi
+    if [[ -n $effective_slack ]]; then
+        _dispatch_notification slack Slack \
+            send_slack_notification "$_slack_msg" "$effective_slack"
+    fi
+    if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]]; then
+        _dispatch_notification telegram Telegram \
+            send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
+    fi
+    if [[ -n $effective_gotify_url ]]; then
+        _dispatch_notification gotify Gotify \
+            send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
+    fi
+    if [[ -n $effective_ntfy_url ]]; then
+        _dispatch_notification ntfy ntfy \
+            send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
+    fi
+    if [[ -n $effective_teams_webhook ]]; then
+        _dispatch_notification teams Teams \
+            send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
+    fi
+    if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]]; then
+        _dispatch_notification matrix Matrix \
+            send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
+            "$effective_matrix_room_id" "$effective_matrix_token"
+    fi
+    write_rollup_entry "$status_generic" "$container_name" "$image_name" \
+        "${container_image_digest#sha256:}" "${image_digest#sha256:}"
+    if _state_path_safe "${CACHE_LOCATION}/hoist-${safe_name}.notified"; then
+        ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
+    fi
+    _tokens+=("notified")
+}
+# --- end process_container helpers ----------------------------------------
+
+process_container() {
+    local container_name="$1"
+    local safe_name
+    _sanitize_name safe_name "$container_name"
+    local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
+    # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
+    _state_path_safe "$_result_file" || return 1
+    local -a _tokens=()
+    log "$container_name: Checking..."
+
+    # Metadata locals — _get_container_metadata populates these in our frame via
+    # dynamic scope, so they must be declared (not assigned) here to survive.
+    local image_name container_image_digest
+    local docker_compose_service docker_compose_version docker_compose_workdir
+    local old_oci_version old_oci_revision
+    local hoist_update hoist_notify hoist_discord_webhook hoist_generic_webhook hoist_slack_webhook
+    local hoist_telegram_bot_token hoist_telegram_chat_id
+    local hoist_gotify_url hoist_ntfy_url hoist_ntfy_token hoist_teams_webhook
+    local hoist_matrix_homeserver hoist_matrix_room_id hoist_matrix_token
+    local hoist_pause_until hoist_constraint hoist_group
+    local hoist_healthcheck_wait hoist_healthcheck_timeout hoist_rollback
+    local hoist_registry_authfile
+    local -a hoist_script_update hoist_script_notify
+    local effective_discord effective_generic effective_slack
+    local effective_telegram_bot_token effective_telegram_chat_id
+    local effective_gotify_url effective_ntfy_url effective_ntfy_token effective_teams_webhook
+    local effective_matrix_homeserver effective_matrix_room_id effective_matrix_token
+
+    if ! _get_container_metadata; then
+        printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+        return 1
     fi
 
     if [[ -n $docker_compose_version ]] && { _is_true "$hoist_update" || _is_true "$hoist_notify"; }; then
@@ -2213,264 +2516,22 @@ process_container() {
             printf '%s\n' "${_tokens[@]}" >> "$_result_file"
             return 0
         fi
-        if [[ -n "$hoist_registry_authfile" ]]; then
-            if [[ "$hoist_registry_authfile" != /* ]]; then
-                log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
-            elif [[ -f "$hoist_registry_authfile" ]]; then
-                # The authfile holds a plaintext registry password; warn loudly
-                # if it's readable beyond its owner so a misconfigured 0644 file
-                # doesn't leak credentials to every local user unnoticed.
-                local _auth_perm
-                _auth_perm=$(stat -c '%a' "$hoist_registry_authfile" 2>/dev/null \
-                    || stat -f '%Lp' "$hoist_registry_authfile" 2>/dev/null)
-                if [[ -n $_auth_perm && $(( 8#$_auth_perm & 0077 )) -ne 0 ]]; then
-                    log "$container_name: Warning: authfile $hoist_registry_authfile is group/world-accessible (mode $_auth_perm) — chmod 600 it"
-                fi
-                log "$container_name: Registry login..."
-                if [[ $DRY_RUN != true ]]; then
-                    local _auth_user _auth_pass _auth_reg
-                    _auth_user=$(jq -r '.username // ""' < "$hoist_registry_authfile")
-                    _auth_pass=$(jq -r '.password // ""' < "$hoist_registry_authfile")
-                    _auth_reg=$(jq -r '.registry // ""' < "$hoist_registry_authfile")
-                    if [[ -z $_auth_user || -z $_auth_pass || -z $_auth_reg ]]; then
-                        log "$container_name: registry login skipped — authfile missing username, password, or registry"
-                    elif ! printf '%s' "$_auth_pass" | "${DOCKER_BINARY}" login \
-                            --username "$_auth_user" --password-stdin "$_auth_reg" >/dev/null 2>&1; then
-                        log "$container_name: registry login failed for $_auth_reg"
-                    fi
-                fi
-            fi
-        fi
+        _registry_login
 
         local image_digest new_oci_version new_oci_revision
-        if [[ $DRY_RUN == true ]]; then
-            # Read-only: do not pull (a pull would re-point the tag and demote
-            # the running image to dangling). We therefore can't compare digests
-            # — report eligibility (configured + not paused) rather than claiming
-            # an update is available.
-            log "$container_name: [dry-run] eligible — a live run would pull and check for an update"
-            image_digest="$container_image_digest"
-            _is_true "$hoist_update" && _tokens+=("would_update")
-            _is_true "$hoist_notify" && _tokens+=("would_notify")
-        else
-            log "$container_name: Pulling image..."
-            compose_pull_wrapper "$docker_compose_workdir" "$docker_compose_service" || {
-                log "$container_name: Pull failed"
-                if [[ -n $hoist_group ]]; then
-                    local _g_safe
-                    _sanitize_name _g_safe "$hoist_group"
-                    _state_path_safe "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" \
-                        && : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
-                fi
-                _tokens+=("update_failed")
-                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
-                return 1
-            }
-
-            local image_inspect _img_out
-            image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name" 2>/dev/null) || {
-                log "$container_name: docker image inspect failed for $image_name (image missing after pull?)"
-                _tokens+=("update_failed")
-                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
-                return 1
-            }
-            _img_out=$(jq -r '
-                .[0] |
-                .Id,
-                (.Config.Labels["org.opencontainers.image.version"] // ""),
-                (.Config.Labels["org.opencontainers.image.revision"] // "")
-            ' <<< "$image_inspect") || {
-                log "$container_name: failed to parse image inspect output"
-                _tokens+=("update_failed")
-                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
-                return 1
-            }
-            readarray -t _img <<< "$_img_out"
-            image_digest="${_img[0]}"
-            new_oci_version="${_img[1]}"
-            new_oci_revision="${_img[2]}"
-            # docker prints `[]` for a missing image, so jq succeeds with a null
-            # .Id — guard against an empty digest before any compare/update.
-            if [[ -z $image_digest || $image_digest == null ]]; then
-                log "$container_name: image inspect returned no image ID for $image_name"
-                _tokens+=("update_failed")
-                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
-                return 1
-            fi
+        if ! _pull_and_compare_digest; then
+            printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+            return 1
         fi
 
-        local status="🔄 Update available" status_generic="update_available" color=3447003
-
-        # Constraint check: if violated, block update but still allow notify
-        local _constraint_blocked=false
-        if [[ -n $hoist_constraint && -n $new_oci_version ]] \
-           && ! _semver_satisfies "$hoist_constraint" "$new_oci_version"; then
-            log "$container_name: constraint '$hoist_constraint' violated by version '$new_oci_version' — blocking update"
-            _constraint_blocked=true
-            _tokens+=("constraint_blocked")
-            status="🔒 Update blocked by constraint ${hoist_constraint} (image=${new_oci_version})"
-            status_generic="update_blocked"
-            color=15105570
-        fi
-
-        # Group abort: if any peer in the same group already failed to pull, skip update
-        local _group_aborted=false
-        if [[ -n $hoist_group ]]; then
-            local _g_safe
-            _sanitize_name _g_safe "$hoist_group"
-            if [[ -f "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" ]]; then
-                log "$container_name: group '$hoist_group' has a failed peer — aborting update"
-                _group_aborted=true
-                _tokens+=("group_aborted")
-                status="🚫 Update aborted (group '${hoist_group}' had a failed peer)"
-                status_generic="update_aborted"
-                color=15105570
-            fi
-        fi
-
-        if [[ $image_digest != "$container_image_digest" && $_constraint_blocked != true && $_group_aborted != true ]] \
-           && _is_true "$hoist_update"; then
-            if [[ $DRY_RUN == true ]]; then
-                log "$container_name: [dry-run] would update container"
-            else
-                if [[ -n "${hoist_script_update[*]}" ]]; then
-                    log "$container_name: Stopping container..."
-                    "${DOCKER_BINARY}" stop "$container_name"
-                    log "$container_name: Executing update script..."
-                    export HOIST_CONTAINER="$container_name"
-                    export HOIST_IMAGE="$image_name"
-                    export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
-                    export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
-                    export HOIST_OLD_VERSION="$old_oci_version"
-                    export HOIST_NEW_VERSION="$new_oci_version"
-                    export HOIST_OLD_REVISION="$old_oci_revision"
-                    export HOIST_NEW_REVISION="$new_oci_revision"
-                    export HOIST_COMPOSE_SERVICE="$docker_compose_service"
-                    export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
-                    "${hoist_script_update[@]}"
-                fi
-                log "$container_name: Updating container..."
-                local _rollback_enabled=false
-                if _is_true "$hoist_rollback" || { [[ -z $hoist_rollback ]] && _is_true "$ROLLBACK_DEFAULT"; }; then
-                    _rollback_enabled=true
-                fi
-                local _hc_timeout="${hoist_healthcheck_timeout:-$HEALTHCHECK_TIMEOUT}"
-                local _update_ok=false _hc_ok=true
-                if compose_up_wrapper "$docker_compose_workdir" "$docker_compose_service"; then
-                    _update_ok=true
-                    if _is_true "$hoist_healthcheck_wait"; then
-                        log "$container_name: Waiting up to ${_hc_timeout}s for healthy..."
-                        if ! _wait_for_healthy "$container_name" "$_hc_timeout"; then
-                            _hc_ok=false
-                            log "$container_name: container failed healthcheck after update"
-                        fi
-                    fi
-                fi
-
-                if [[ $_update_ok == true && $_hc_ok == true ]]; then
-                    status="✅ Update succeeded"
-                    status_generic="update_success"
-                    color=3066993
-                    _tokens+=("updated")
-                else
-                    if [[ $_update_ok == true && $_hc_ok != true ]]; then
-                        status="❌ Update unhealthy"
-                        status_generic="update_failure"
-                        _tokens+=("unhealthy")
-                    else
-                        log "$container_name: Update failed"
-                        status="❌ Update failed"
-                        status_generic="update_failure"
-                        _tokens+=("update_failed")
-                    fi
-                    color=15158332
-                    if [[ $_rollback_enabled == true ]]; then
-                        if _rollback_container "$container_name" "$docker_compose_workdir" "$docker_compose_service" "$image_name" "$container_image_digest"; then
-                            _tokens+=("rolled_back")
-                            status+=" (rolled back)"
-                        else
-                            _tokens+=("rollback_failed")
-                            status+=" (rollback failed)"
-                        fi
-                    fi
-                fi
-                rm -f "${CACHE_LOCATION}/hoist-${safe_name}.notified"
-            fi
-        fi
-
-        if [[ $image_digest != "$container_image_digest" && $DRY_RUN != true ]] && _is_true "$hoist_notify"; then
-            local notified_digest
-            notified_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
-            if [[ $notified_digest != "$image_digest" ]]; then
-                if [[ -n "${hoist_script_notify[*]}" ]]; then
-                    log "$container_name: Executing notify script..."
-                    export HOIST_CONTAINER="$container_name"
-                    export HOIST_IMAGE="$image_name"
-                    export HOIST_OLD_IMAGE_ID="${container_image_digest#sha256:}"
-                    export HOIST_NEW_IMAGE_ID="${image_digest#sha256:}"
-                    export HOIST_OLD_VERSION="$old_oci_version"
-                    export HOIST_NEW_VERSION="$new_oci_version"
-                    export HOIST_OLD_REVISION="$old_oci_revision"
-                    export HOIST_NEW_REVISION="$new_oci_revision"
-                    export HOIST_COMPOSE_SERVICE="$docker_compose_service"
-                    export HOIST_COMPOSE_WORKDIR="$docker_compose_workdir"
-                    "${hoist_script_notify[@]}"
-                fi
-                local _slack_msg="[$container_name] $status: $image_name"
-                # Per-channel dispatch: each block gates on credential presence,
-                # then _dispatch_notification applies the rollup-skip check and
-                # the standard log line. Senders' signatures differ too much for
-                # a string-keyed table to hold them, so the credential guards
-                # stay inline and readable.
-                if [[ -n $effective_discord ]]; then
-                    _dispatch_notification discord Discord \
-                        send_discord_notification "$status" "$container_name" \
-                        "$old_oci_version" "$new_oci_version" "$image_name" \
-                        "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
-                        "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
-                fi
-                if [[ -n $effective_generic ]]; then
-                    _dispatch_notification generic "generic webhook" \
-                        send_generic_webhook "$status_generic" "$container_name" \
-                        "$old_oci_version" "$new_oci_version" "$image_name" \
-                        "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
-                        "${container_image_digest#sha256:}" "${image_digest#sha256:}"
-                fi
-                if [[ -n $effective_slack ]]; then
-                    _dispatch_notification slack Slack \
-                        send_slack_notification "$_slack_msg" "$effective_slack"
-                fi
-                if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]]; then
-                    _dispatch_notification telegram Telegram \
-                        send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
-                fi
-                if [[ -n $effective_gotify_url ]]; then
-                    _dispatch_notification gotify Gotify \
-                        send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
-                fi
-                if [[ -n $effective_ntfy_url ]]; then
-                    _dispatch_notification ntfy ntfy \
-                        send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
-                fi
-                if [[ -n $effective_teams_webhook ]]; then
-                    _dispatch_notification teams Teams \
-                        send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
-                fi
-                if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]]; then
-                    _dispatch_notification matrix Matrix \
-                        send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
-                        "$effective_matrix_room_id" "$effective_matrix_token"
-                fi
-                write_rollup_entry "$status_generic" "$container_name" "$image_name" \
-                    "${container_image_digest#sha256:}" "${image_digest#sha256:}"
-                if _state_path_safe "${CACHE_LOCATION}/hoist-${safe_name}.notified"; then
-                    ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
-                fi
-                _tokens+=("notified")
-            fi
-        fi
+        # status/color and the policy flags live in this frame so _evaluate_policies
+        # can seed them and _apply_update / _dispatch_notifications can read them.
+        local status status_generic color _constraint_blocked _group_aborted
+        _evaluate_policies
+        _apply_update
+        _dispatch_notifications
     elif _is_true "$hoist_update" || _is_true "$hoist_notify"; then
-        # Reached the else only because docker_compose_version is empty: the
+        # Reached the elif only because docker_compose_version is empty: the
         # container is labelled to act but isn't compose-managed, so hoist has
         # no compose project to pull/recreate through. Warn unconditionally
         # (this is almost certainly a misconfiguration) with a distinct token.
