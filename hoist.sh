@@ -253,6 +253,16 @@ done
 
 _validate_maintenance_window "$MAINTENANCE_WINDOW" || exit 2
 
+# Ensure CACHE_LOCATION exists, and lock it to 0700 when it's a directory we
+# create. We deliberately leave the shared default (/tmp) alone: it's sticky,
+# world-writable by design, and not ours to chmod. State files written there
+# get a symlink guard at each write site (_state_path_safe) instead.
+if [[ "$CACHE_LOCATION" != "/tmp" ]]; then
+    mkdir -p "$CACHE_LOCATION" 2>/dev/null \
+        || { echo "Error: cannot create CACHE_LOCATION: $CACHE_LOCATION" >&2; exit 1; }
+    [[ -O "$CACHE_LOCATION" ]] && chmod 0700 "$CACHE_LOCATION" 2>/dev/null || true
+fi
+
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 }
 
@@ -268,6 +278,19 @@ setup_environment() {
     export GLOBAL_MATRIX_HOMESERVER GLOBAL_MATRIX_ROOM_ID GLOBAL_MATRIX_TOKEN
     export HEALTHCHECKS_PING_URL WEBHOOK_ROLLUP WEBHOOK_ROLLUP_CHANNELS
     export HEALTHCHECK_TIMEOUT HEALTHCHECK_INTERVAL ROLLBACK_DEFAULT
+}
+
+# State files live in a shared, predictably-named CACHE_LOCATION (default /tmp).
+# An attacker who can guess our filename could pre-plant a symlink so our write
+# lands on a victim file. On a sticky /tmp we usually can't delete another
+# user's symlink, so the safe move is to refuse to write through it rather than
+# follow it. Returns 1 (caller skips the write) when the target is a symlink.
+_state_path_safe() {
+    if [[ -L "$1" ]]; then
+        log "Refusing to write state file through a symlink: $1"
+        return 1
+    fi
+    return 0
 }
 
 # _validate_maintenance_window <window>  -> 0 if empty or well-formed,
@@ -869,8 +892,10 @@ _self_update_check() {
 
     if [[ $interactive == false ]]; then
         _self_update_notify "$latest_version" "$release_url"
-        ( umask 177 && printf '%s' "$latest_version" > "$sentinel" ) || \
-            log "Warning: could not write update sentinel ${sentinel} — notifications may repeat"
+        if _state_path_safe "$sentinel"; then
+            ( umask 177 && printf '%s' "$latest_version" > "$sentinel" ) || \
+                log "Warning: could not write update sentinel ${sentinel} — notifications may repeat"
+        fi
         if [[ $UPDATE_CHECK == "update" ]]; then
             log "UPDATE_CHECK=update — applying automatically"
             _self_update_apply "$latest_version" "$asset_url" "$sha256_url" true || \
@@ -1883,6 +1908,7 @@ write_rollup_entry() {
     [[ $WEBHOOK_ROLLUP == true ]] || return 0
     local safe
     safe=$(printf '%s' "$2" | tr -cs '[:alnum:]._-' '_')
+    _state_path_safe "${CACHE_LOCATION}/hoist-${safe}.rollup" || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" \
         > "${CACHE_LOCATION}/hoist-${safe}.rollup"
 }
@@ -1955,6 +1981,8 @@ process_container() {
     local safe_name
     safe_name=$(printf '%s' "$container_name" | tr -cs '[:alnum:]._-' '_')
     local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
+    # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
+    _state_path_safe "$_result_file" || return 1
     local -a _tokens=()
     log "$container_name: Checking..."
 
@@ -2142,7 +2170,8 @@ process_container() {
                 if [[ -n $hoist_group ]]; then
                     local _g_safe
                     _g_safe=$(printf '%s' "$hoist_group" | tr -cs '[:alnum:]._-' '_')
-                    : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
+                    _state_path_safe "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed" \
+                        && : > "${CACHE_LOCATION}/hoist-group-${_g_safe}.failed"
                 fi
                 _tokens+=("update_failed")
                 printf '%s\n' "${_tokens[@]}" >> "$_result_file"
@@ -2340,7 +2369,9 @@ process_container() {
                 fi
                 write_rollup_entry "$status_generic" "$container_name" "$image_name" \
                     "${container_image_digest#sha256:}" "${image_digest#sha256:}"
-                ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
+                if _state_path_safe "${CACHE_LOCATION}/hoist-${safe_name}.notified"; then
+                    ( umask 177 && printf '%s' "$image_digest" > "${CACHE_LOCATION}/hoist-${safe_name}.notified" )
+                fi
                 _tokens+=("notified")
             fi
         fi
