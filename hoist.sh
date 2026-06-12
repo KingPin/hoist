@@ -644,9 +644,13 @@ _self_update_apply() {
     }
     [[ -w $script_path ]] || { log "Error: $script_path is not writable — cannot self-update"; return 1; }
 
-    local tmp_script tmp_sha256
-    tmp_script=$(mktemp /tmp/hoist-update-XXXXXX) || {
-        log "Error: cannot create temp file for update download"
+    local tmp_script tmp_sha256 script_dir
+    script_dir=$(dirname "$script_path")
+    # Create the replacement in the script's own directory so the final mv is a
+    # same-filesystem atomic rename, not a cross-fs copy into the live inode
+    # (which a concurrent reader could observe half-written).
+    tmp_script=$(mktemp "${script_dir}/.hoist-update-XXXXXX") || {
+        log "Error: cannot create temp file in ${script_dir} for update download"
         return 1
     }
     tmp_sha256=$(mktemp /tmp/hoist-update-XXXXXX.sha256) || {
