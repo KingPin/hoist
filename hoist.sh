@@ -286,18 +286,58 @@ check_maintenance_window() {
     fi
 }
 
+# Serialize docker-compose operations per project directory. In --parallel mode
+# two sibling containers that share a compose project would otherwise run
+# `compose pull` / `compose up` against the same project set concurrently, which
+# races on the project's container list (and on the rollback re-tag). An
+# exclusive per-project lock, keyed on a hash of the absolute workdir, makes each
+# pull/up atomic with respect to its siblings. Different projects still run fully
+# in parallel. Prefers flock; falls back to an mkdir spinlock when flock is
+# absent. The lock blocks (siblings queue) rather than failing.
+_with_project_lock() {
+    local workdir="$1"; shift
+    local key lock rc
+    key=$(cksum <<< "$workdir"); key=${key%% *}
+    lock="${CACHE_LOCATION}/hoist-project-${key}.lock"
+    if command -v flock >/dev/null 2>&1; then
+        local fd
+        exec {fd}>"$lock" || { log "Error: cannot open project lock $lock"; return 1; }
+        flock "$fd"
+        "$@"; rc=$?
+        exec {fd}>&-
+        return "$rc"
+    fi
+    local lockdir="${lock}.d" holder
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        holder=""
+        [[ -f "$lockdir/pid" ]] && holder=$(cat "$lockdir/pid" 2>/dev/null)
+        if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then
+            rm -rf "$lockdir"; continue
+        fi
+        sleep 0.2
+    done
+    echo "$$" > "$lockdir/pid"
+    "$@"; rc=$?
+    rm -rf "$lockdir"
+    return "$rc"
+}
+
 # The cd runs inside a subshell so the working-directory change never leaks
 # into the caller (which processes many containers across different workdirs).
+_compose_exec() {
+    local workdir="$1" service="$2"; shift 2
+    ( cd "$workdir" || { log "Error: cannot cd to compose workdir: $workdir"; exit 1; }
+      "${DOCKER_BINARY}" compose "$@" "$service" )
+}
+
 compose_pull_wrapper() {
     [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
-    ( cd "$1" || { log "Error: cannot cd to compose workdir: $1"; exit 1; }
-      "${DOCKER_BINARY}" compose pull "$2" )
+    _with_project_lock "$1" _compose_exec "$1" "$2" pull
 }
 
 compose_up_wrapper() {
     [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
-    ( cd "$1" || { log "Error: cannot cd to compose workdir: $1"; exit 1; }
-      "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2" )
+    _with_project_lock "$1" _compose_exec "$1" "$2" up -d --always-recreate-deps
 }
 
 # Take an exclusive run lock so two hoist runs never process the same fleet
@@ -518,12 +558,25 @@ _rollback_container() {
         log "$container: rollback failed — compose workdir '$workdir' is missing"
         return 1
     fi
+    log "$container: rolling back to $old_sha"
+    # The re-tag + compose-up is one critical section: it assumes the tag it sets
+    # is the image compose reads back. Run it under the per-project lock so a
+    # sibling worker pulling/recreating the same project can't re-tag the image
+    # in between (the rollback re-tag race the project lock subsumes).
+    _with_project_lock "$workdir" _rollback_retag_up \
+        "$container" "$workdir" "$service" "$image_name" "$old_sha"
+}
+
+# Critical section of a rollback: re-alias the old SHA onto the tag, re-run
+# compose up without pulling, and undo the re-tag if the up fails. Always run
+# via _with_project_lock so it is atomic against sibling compose operations.
+_rollback_retag_up() {
+    local container="$1" workdir="$2" service="$3" image_name="$4" old_sha="$5"
     # Remember what the tag currently points at so a failed rollback can be
     # restored rather than leaving the tag aliased to an image that was never
     # brought up.
     local prev_target
     prev_target=$("${DOCKER_BINARY}" image inspect --format '{{.Id}}' "$image_name" 2>/dev/null)
-    log "$container: rolling back to $old_sha"
     if ! "${DOCKER_BINARY}" tag "$old_sha" "$image_name"; then
         log "$container: rollback failed — could not re-tag $old_sha as $image_name"
         return 1
