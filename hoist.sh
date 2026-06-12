@@ -2220,6 +2220,13 @@ process_container() {
                 _tokens+=("notified")
             fi
         fi
+    elif _is_true "$hoist_update" || _is_true "$hoist_notify"; then
+        # Reached the else only because docker_compose_version is empty: the
+        # container is labelled to act but isn't compose-managed, so hoist has
+        # no compose project to pull/recreate through. Warn unconditionally
+        # (this is almost certainly a misconfiguration) with a distinct token.
+        log "$container_name: has hoist update/notify labels but is not compose-managed (no com.docker.compose.* labels) — skipping"
+        _tokens+=("not_compose_managed")
     else
         [[ $VERBOSE == true ]] && log "$container_name: Skipped (no hoist labels)"
         _tokens+=("skipped")
@@ -2234,7 +2241,7 @@ print_summary() {
     local updated=0 update_failed=0 notified=0 no_change=0 skipped=0
     local would_update=0 would_notify=0
     local paused=0 constraint_blocked=0 group_aborted=0
-    local unhealthy=0 rolled_back=0 rollback_failed=0
+    local unhealthy=0 rolled_back=0 rollback_failed=0 not_compose_managed=0
     local f token
     for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
         [[ -f $f ]] || continue
@@ -2253,6 +2260,7 @@ print_summary() {
                 unhealthy)          (( unhealthy++ )) ;;
                 rolled_back)        (( rolled_back++ )) ;;
                 rollback_failed)    (( rollback_failed++ )) ;;
+                not_compose_managed) (( not_compose_managed++ )) ;;
             esac
         done < "$f"
     done
@@ -2274,6 +2282,7 @@ print_summary() {
     [[ $paused -gt 0 ]]             && msg+=", ${paused} paused"
     [[ $constraint_blocked -gt 0 ]] && msg+=", ${constraint_blocked} constraint-blocked"
     [[ $group_aborted -gt 0 ]]      && msg+=", ${group_aborted} group-aborted"
+    [[ $not_compose_managed -gt 0 ]] && msg+=", ${not_compose_managed} not-compose-managed"
     log "$msg"
 }
 
