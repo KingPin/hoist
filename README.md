@@ -112,7 +112,7 @@ After every run, hoist prints a one-line summary:
 [HH:MM:SS] Run complete: 3 updated (1 failed), 2 notified, 5 no-change, 12 skipped
 ```
 
-In `--dry-run` mode this becomes `Run complete (dry-run): N would update, N would notify, ...`.
+In `--dry-run` mode this becomes `Run complete (dry-run): N eligible to update, N eligible to notify (not pulled — run live to detect available updates), ...`. Dry-run does **not** pull images (a pull would re-point the tag and demote the running image to dangling), so it reports which containers are *configured and not paused* to act — not which actually have a newer image waiting.
 
 ## Labels
 

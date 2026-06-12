@@ -2003,7 +2003,11 @@ process_container() {
 
         local image_digest new_oci_version new_oci_revision
         if [[ $DRY_RUN == true ]]; then
-            log "$container_name: [dry-run] would pull image"
+            # Read-only: do not pull (a pull would re-point the tag and demote
+            # the running image to dangling). We therefore can't compare digests
+            # — report eligibility (configured + not paused) rather than claiming
+            # an update is available.
+            log "$container_name: [dry-run] eligible — a live run would pull and check for an update"
             image_digest="$container_image_digest"
             _is_true "$hoist_update" && _tokens+=("would_update")
             _is_true "$hoist_notify" && _tokens+=("would_notify")
@@ -2255,7 +2259,10 @@ print_summary() {
 
     local msg
     if [[ $DRY_RUN == true ]]; then
-        msg="Run complete (dry-run): ${would_update} would update, ${would_notify} would notify, ${no_change} no-change, ${skipped} skipped"
+        # Dry-run does not pull, so it cannot know which containers actually have
+        # a newer image waiting — only which are configured (and not paused) to
+        # act. Report eligibility, not a spurious "would update" claim.
+        msg="Run complete (dry-run): ${would_update} eligible to update, ${would_notify} eligible to notify (not pulled — run live to detect available updates), ${skipped} skipped"
     else
         local updated_part="${updated} updated"
         [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
