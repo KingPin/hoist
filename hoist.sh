@@ -702,9 +702,8 @@ _self_update_notify() {
               "username":"Hoist"}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build Discord payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" -- "$GLOBAL_DISCORD_WEBHOOK" 2>/dev/null || \
+        [[ -n $payload ]] && _send_webhook "$GLOBAL_DISCORD_WEBHOOK" "$payload" \
+            -L -H "Content-Type: application/json" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: Discord self-update notification failed"; }
     fi
     if [[ -n $GLOBAL_SLACK_WEBHOOK ]]; then
@@ -713,9 +712,8 @@ _self_update_notify() {
             '{"text":$t}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build Slack payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" -- "$GLOBAL_SLACK_WEBHOOK" 2>/dev/null || \
+        [[ -n $payload ]] && _send_webhook "$GLOBAL_SLACK_WEBHOOK" "$payload" \
+            -L -H "Content-Type: application/json" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: Slack self-update notification failed"; }
     fi
     if [[ -n $GLOBAL_GENERIC_WEBHOOK ]]; then
@@ -728,9 +726,8 @@ _self_update_notify() {
             '{"type":$type,"current_version":$cur,"new_version":$new,"release_url":$url,"timestamp":$ts}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build generic payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-            -H "User-Agent: Hoist" -H "Content-Type: application/json" \
-            -d "$payload" -- "$GLOBAL_GENERIC_WEBHOOK" 2>/dev/null || \
+        [[ -n $payload ]] && _send_webhook "$GLOBAL_GENERIC_WEBHOOK" "$payload" \
+            -L -H "Content-Type: application/json" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: generic self-update notification failed"; }
     fi
 }
@@ -1779,6 +1776,19 @@ _cron_dispatch() {
     esac
 }
 
+# _send_webhook <url> <data> [extra curl args...]
+# Single owner of the notification curl invocation: shared timeouts, the
+# User-Agent, the --proto allow-list, and the default of NOT following
+# redirects. Most channels embed a token in the URL or an auth header that a
+# redirect to a foreign host would leak, so -L is opt-in per call (only
+# discord/slack/generic pass it). Extra args carry per-channel headers, -L,
+# or -X PUT. The body is always sent via -d.
+_send_webhook() {
+    local url="$1" data="$2"; shift 2
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        -H "User-Agent: Hoist" "$@" -d "$data" "$url"
+}
+
 send_discord_notification() {
     local description="$1" container="$2" old_version="$3" new_version="$4"
     local image="$5" webhook="$6" old_revision="$7" new_revision="$8"
@@ -1819,8 +1829,8 @@ send_discord_notification() {
             "footer":{"text":$footer},"timestamp":$ts}],
           "username":"Hoist"}')
     validate_webhook_url "$webhook" || return 1
-    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
+    # -L: the webhook URL is the whole secret and Discord may 30x within its host.
+    _send_webhook "$webhook" "$payload" -L -H "Content-Type: application/json"
 }
 
 send_generic_webhook() {
@@ -1838,16 +1848,16 @@ send_generic_webhook() {
           "old_revision":$old_revision,"new_revision":$new_revision,
           "timestamp":$ts}')
     validate_webhook_url "$6" || return 1
-    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$6"
+    # -L: the webhook URL is the whole secret; the endpoint may 30x within its host.
+    _send_webhook "$6" "$payload" -L -H "Content-Type: application/json"
 }
 
 send_slack_notification() {
     local payload
     payload=$(jq -n --arg text "$1" '{"text":$text}')
     validate_webhook_url "$2" || return 1
-    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
+    # -L: the webhook URL is the whole secret; Slack may 30x within its host.
+    _send_webhook "$2" "$payload" -L -H "Content-Type: application/json"
 }
 
 # send_telegram_notification <text> <bot_token> <chat_id>
@@ -1859,9 +1869,8 @@ send_telegram_notification() {
         '{"chat_id":$chat,"text":$text,"disable_web_page_preview":true}')
     # No -L: Telegram bot token is in the URL path; following a redirect
     # to a different host would leak the token.
-    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" \
-        "https://api.telegram.org/bot${token}/sendMessage"
+    _send_webhook "https://api.telegram.org/bot${token}/sendMessage" "$payload" \
+        -H "Content-Type: application/json"
 }
 
 # send_gotify_notification <title> <message> <url>  (url may include ?token=...)
@@ -1873,19 +1882,18 @@ send_gotify_notification() {
         '{"title":$t,"message":$m,"priority":5}')
     # No -L: Gotify URLs typically embed the token as ?token=...; a redirect
     # to another host would leak it.
-    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$url"
+    _send_webhook "$url" "$payload" -H "Content-Type: application/json"
 }
 
 # send_ntfy_notification <title> <message> <url> [token]
 send_ntfy_notification() {
     local title="$1" message="$2" url="$3" token="${4:-}"
     validate_webhook_url "$url" || return 1
-    local -a hdrs=(-H "User-Agent: Hoist" -H "Title: $title" -H "Priority: default")
+    # User-Agent is added by _send_webhook; the rest are ntfy's own headers.
+    local -a hdrs=(-H "Title: $title" -H "Priority: default")
     [[ -n $token ]] && hdrs+=(-H "Authorization: Bearer $token")
     # No -L: ntfy bearer token in Authorization header would leak on redirect.
-    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        "${hdrs[@]}" -d "$message" "$url"
+    _send_webhook "$url" "$message" "${hdrs[@]}"
 }
 
 # send_teams_notification <title> <message> <webhook>
@@ -1898,8 +1906,7 @@ send_teams_notification() {
           "summary":$t,"themeColor":"0076D7","title":$t,"text":$m}')
     # No -L: Teams webhook URL is itself a credential; following redirects
     # to a different host risks exposing it.
-    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
-        -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
+    _send_webhook "$webhook" "$payload" -H "Content-Type: application/json"
 }
 
 # send_matrix_notification <message> <homeserver> <room_id> <access_token>
@@ -1912,9 +1919,8 @@ send_matrix_notification() {
     url="${homeserver%/}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn}"
     payload=$(jq -n --arg body "$message" '{"msgtype":"m.text","body":$body}')
     # No -L: Matrix access token in Authorization header would leak on redirect.
-    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
-        -H "User-Agent: Hoist" -H "Authorization: Bearer ${token}" \
-        -H "Content-Type: application/json" -d "$payload" "$url"
+    _send_webhook "$url" "$payload" -X PUT \
+        -H "Authorization: Bearer ${token}" -H "Content-Type: application/json"
 }
 
 # _hc_ping [start|fail|""]  (suffix optional; empty = success)
