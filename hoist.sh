@@ -300,6 +300,44 @@ compose_up_wrapper() {
       "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2" )
 }
 
+# Take an exclusive run lock so two hoist runs never process the same fleet
+# concurrently (double pulls, racing compose up, clobbered run-result state).
+# Prefers flock (kernel lock, auto-released when the fd closes on exit); falls
+# back to an atomic mkdir lock with stale-PID detection when flock is absent.
+# A held lock is not an error — hoist exits 0 so overlapping cron ticks are
+# harmless.
+_acquire_run_lock() {
+    local lock="${CACHE_LOCATION}/hoist.lock"
+    if command -v flock >/dev/null 2>&1; then
+        exec {_LOCK_FD}>"$lock" || { log "Error: cannot open run lock $lock"; exit 1; }
+        if ! flock -n "$_LOCK_FD"; then
+            log "Another hoist run holds the lock ($lock); exiting."
+            exit 0
+        fi
+        return 0
+    fi
+    # flock unavailable: atomic mkdir lock. mkdir fails if the dir exists, which
+    # is our mutex; a recorded PID that is no longer alive means a crashed run.
+    local lockdir="${lock}.d"
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        local holder=""
+        [[ -f "$lockdir/pid" ]] && holder=$(cat "$lockdir/pid" 2>/dev/null)
+        if [[ -n $holder ]] && ! kill -0 "$holder" 2>/dev/null; then
+            log "Removing stale run lock (pid $holder no longer running)"
+            rm -rf "$lockdir"
+            continue
+        fi
+        log "Another hoist run holds the lock ($lockdir, pid ${holder:-unknown}); exiting."
+        exit 0
+    done
+    echo "$$" > "$lockdir/pid"
+    _RUN_LOCKDIR="$lockdir"
+    # EXIT also fires after the INT/TERM handler runs `exit 130`, so this one
+    # trap covers normal and signalled termination. Background workers run in
+    # subshells that reset traps, so they won't remove the lock.
+    trap '[[ -n "${_RUN_LOCKDIR:-}" ]] && rm -rf "$_RUN_LOCKDIR"' EXIT
+}
+
 validate_webhook_url() {
     [[ "$1" =~ ^https?:// ]] || { log "Error: invalid webhook URL (must start with http:// or https://): $1"; return 1; }
 }
@@ -2354,6 +2392,10 @@ if [[ $DO_LIST == true ]]; then
     list_containers
     exit 0
 fi
+
+# Serialize runs (after --list, which is read-only and needs no lock) so the
+# shared run-result/rollup state below isn't clobbered by an overlapping run.
+_acquire_run_lock
 
 rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
 rmdir "${CACHE_LOCATION}"/hoist-compose-*.deduped 2>/dev/null || true
