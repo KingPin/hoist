@@ -197,6 +197,8 @@ for _wh_var in GLOBAL_DISCORD_WEBHOOK GLOBAL_SLACK_WEBHOOK GLOBAL_GENERIC_WEBHOO
     fi
 done
 
+_validate_maintenance_window "$MAINTENANCE_WINDOW" || exit 2
+
 log "TAG=${TAG} | DRY_RUN=${DRY_RUN} | PARALLEL=${PARALLEL} | VERBOSE=${VERBOSE}"
 }
 
@@ -214,28 +216,44 @@ setup_environment() {
     export HEALTHCHECK_TIMEOUT HEALTHCHECK_INTERVAL ROLLBACK_DEFAULT
 }
 
+# _validate_maintenance_window <window>  -> 0 if empty or well-formed,
+# otherwise echoes an error and returns 1. Format is HH:MM-HH:MM (24h).
+_validate_maintenance_window() {
+    local w="$1"
+    [[ -z "$w" ]] && return 0
+    [[ "$w" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]-([01][0-9]|2[0-3]):[0-5][0-9]$ ]] && return 0
+    echo "Error: MAINTENANCE_WINDOW must be HH:MM-HH:MM (24h), got: $w" >&2
+    return 1
+}
+
+# _in_maintenance_window <window "HH:MM-HH:MM"> <now "HHMM">  -> 0 if now falls
+# inside the window, 1 if outside. Pure (no clock reads). Start is inclusive,
+# end exclusive; a start greater than end means the window spans midnight.
+# Forces base-10 so zero-padded times (e.g. 0900) never hit octal arithmetic.
+_in_maintenance_window() {
+    local window="$1" now="$2" start end
+    start=${window%-*}; start=${start//:/}
+    end=${window#*-};   end=${end//:/}
+    start=$((10#$start)); end=$((10#$end)); now=$((10#$now))
+    if (( start <= end )); then
+        (( now >= start && now < end ))
+    else
+        (( now >= start || now < end ))   # spans midnight
+    fi
+}
+
 check_maintenance_window() {
     [[ -z "$MAINTENANCE_WINDOW" ]] && return 0
     if [[ "$DRY_RUN" == true ]]; then
         log "Maintenance window check bypassed (dry-run)"
         return 0
     fi
-    local start end current
-    start=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f1 | tr -d ':')
-    end=$(echo "$MAINTENANCE_WINDOW" | cut -d'-' -f2 | tr -d ':')
-    current=$(date +%H%M)
-    if [[ "$start" -le "$end" ]]; then
-        if [[ "$current" -lt "$start" || "$current" -ge "$end" ]]; then
-            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
-            exit 0
-        fi
+    if _in_maintenance_window "$MAINTENANCE_WINDOW" "$(date +%H%M)"; then
+        log "Within maintenance window ($MAINTENANCE_WINDOW), proceeding."
     else
-        if [[ "$current" -lt "$start" && "$current" -ge "$end" ]]; then
-            log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
-            exit 0
-        fi
+        log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
+        exit 0
     fi
-    log "Within maintenance window ($MAINTENANCE_WINDOW), proceeding."
 }
 
 compose_pull_wrapper() {
