@@ -16,6 +16,12 @@ Copy `hoist.conf.example` to one of the following locations (first found wins):
 
 CLI flags always override config file values.
 
+> **Security:** the config file is sourced as shell, so it executes with
+> hoist's privileges. Keep it owned by the running user (or root) and not
+> writable by others, and never point `$HOIST_CONFIG` at an attacker-writable
+> path (e.g. a world-writable directory or a file another user controls) — an
+> attacker who can edit it gains arbitrary code execution as the hoist user.
+
 | Setting | Default | Description |
 |---|---|---|
 | `PARALLEL` | `1` | Containers to process concurrently |

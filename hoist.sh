@@ -702,7 +702,7 @@ _self_update_notify() {
               "username":"Hoist"}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build Discord payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
             -d "$payload" -- "$GLOBAL_DISCORD_WEBHOOK" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: Discord self-update notification failed"; }
@@ -713,7 +713,7 @@ _self_update_notify() {
             '{"text":$t}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build Slack payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
             -d "$payload" -- "$GLOBAL_SLACK_WEBHOOK" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: Slack self-update notification failed"; }
@@ -728,7 +728,7 @@ _self_update_notify() {
             '{"type":$type,"current_version":$cur,"new_version":$new,"release_url":$url,"timestamp":$ts}') || {
             [[ $VERBOSE == true ]] && log "Warning: failed to build generic payload for self-update notify"
         }
-        [[ -n $payload ]] && curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+        [[ -n $payload ]] && curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
             -H "User-Agent: Hoist" -H "Content-Type: application/json" \
             -d "$payload" -- "$GLOBAL_GENERIC_WEBHOOK" 2>/dev/null || \
             { [[ $VERBOSE == true ]] && log "Warning: generic self-update notification failed"; }
@@ -761,11 +761,15 @@ _self_update_apply() {
         rm -f "$tmp_script"
         return 1
     }
+    # mktemp already creates these 0600; restate it explicitly so a downloaded
+    # replacement script is never group/world-readable before the atomic mv,
+    # regardless of platform mktemp quirks.
+    chmod 0600 "$tmp_script" "$tmp_sha256" 2>/dev/null || true
 
     _suu_cleanup() { rm -f "$tmp_script" "$tmp_sha256"; }
 
     [[ $silent == false ]] && log "Downloading hoist.sh v${new_ver}..."
-    curl -fsSL --max-time 60 --connect-timeout 10 \
+    curl -fsSL --proto '=https' --max-time 60 --connect-timeout 10 \
         -H "User-Agent: Hoist/${HOIST_VERSION}" \
         -o "$tmp_script" "$asset_url" || {
         log "Error: failed to download hoist v${new_ver} from ${asset_url}"
@@ -773,7 +777,7 @@ _self_update_apply() {
     }
 
     [[ $silent == false ]] && log "Downloading SHA256 checksum..."
-    curl -fsSL --max-time 10 --connect-timeout 5 \
+    curl -fsSL --proto '=https' --max-time 10 --connect-timeout 5 \
         -H "User-Agent: Hoist/${HOIST_VERSION}" \
         -o "$tmp_sha256" "$sha256_url" || {
         log "Error: failed to download SHA256 for hoist v${new_ver} from ${sha256_url}"
@@ -819,7 +823,7 @@ _self_update_check() {
     [[ $interactive == true ]] && timeout_arg=15
 
     local api_response _api_raw _http_code
-    _api_raw=$(curl -sSL -w '\n%{http_code}' \
+    _api_raw=$(curl -sSL --proto '=https' -w '\n%{http_code}' \
         --max-time "$timeout_arg" --connect-timeout 5 \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
@@ -1101,7 +1105,7 @@ _cron_backend_install() {
     local tmp
     tmp=$(mktemp /tmp/hoist-cron.XXXXXX) || { log "Error: cannot create temp file"; return 1; }
     printf '%s\n' "$content" > "$tmp"
-    _sudo_if_needed "$_CRON_PATH_D" install -m 0644 "$tmp" "$_CRON_PATH_D" \
+    _sudo_if_needed "$_CRON_PATH_D" install -m 0640 "$tmp" "$_CRON_PATH_D" \
         || { rm -f "$tmp"; log "Error: failed to install $_CRON_PATH_D"; return 1; }
     rm -f "$tmp"
 
@@ -1207,9 +1211,9 @@ _systemd_backend_install() {
     tmp_tmr=$(mktemp /tmp/hoist-systemd.XXXXXX) || { rm -f "$tmp_svc"; return 1; }
     printf '%s\n' "$svc" > "$tmp_svc"
     printf '%s\n' "$tmr" > "$tmp_tmr"
-    _sudo_if_needed "$_CRON_SYSTEMD_SERVICE" install -m 0644 "$tmp_svc" "$_CRON_SYSTEMD_SERVICE" \
+    _sudo_if_needed "$_CRON_SYSTEMD_SERVICE" install -m 0640 "$tmp_svc" "$_CRON_SYSTEMD_SERVICE" \
         || { rm -f "$tmp_svc" "$tmp_tmr"; log "Error: failed to install $_CRON_SYSTEMD_SERVICE"; return 1; }
-    _sudo_if_needed "$_CRON_SYSTEMD_TIMER" install -m 0644 "$tmp_tmr" "$_CRON_SYSTEMD_TIMER" \
+    _sudo_if_needed "$_CRON_SYSTEMD_TIMER" install -m 0640 "$tmp_tmr" "$_CRON_SYSTEMD_TIMER" \
         || { rm -f "$tmp_svc" "$tmp_tmr"; log "Error: failed to install $_CRON_SYSTEMD_TIMER"; return 1; }
     rm -f "$tmp_svc" "$tmp_tmr"
     _sudo_if_needed /etc/systemd systemctl daemon-reload || return 1
@@ -1491,6 +1495,14 @@ _prompt_schedule() {
 
 _validate_user() {
     local user="$1"
+    # Reject anything that isn't a portable POSIX username before it reaches the
+    # getent/id lookup or the generated cron/systemd unit. This bars embedded
+    # newlines and shell metacharacters that could otherwise inject a directive
+    # into the heredoc-rendered file (the values are interpolated, not quotable
+    # inside a heredoc, so validation is the only line of defense).
+    if [[ ! $user =~ ^[a-zA-Z_][a-zA-Z0-9_-]*\$?$ ]]; then
+        echo "Error: invalid username: $user" >&2; return 1
+    fi
     if command -v getent >/dev/null 2>&1; then
         getent passwd "$user" >/dev/null 2>&1 \
             || { echo "Error: user does not exist: $user" >&2; return 1; }
@@ -1807,7 +1819,7 @@ send_discord_notification() {
             "footer":{"text":$footer},"timestamp":$ts}],
           "username":"Hoist"}')
     validate_webhook_url "$webhook" || return 1
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
 }
 
@@ -1826,7 +1838,7 @@ send_generic_webhook() {
           "old_revision":$old_revision,"new_revision":$new_revision,
           "timestamp":$ts}')
     validate_webhook_url "$6" || return 1
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$6"
 }
 
@@ -1834,7 +1846,7 @@ send_slack_notification() {
     local payload
     payload=$(jq -n --arg text "$1" '{"text":$text}')
     validate_webhook_url "$2" || return 1
-    curl -fsSL --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsSL --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$2"
 }
 
@@ -1847,7 +1859,7 @@ send_telegram_notification() {
         '{"chat_id":$chat,"text":$text,"disable_web_page_preview":true}')
     # No -L: Telegram bot token is in the URL path; following a redirect
     # to a different host would leak the token.
-    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" \
         "https://api.telegram.org/bot${token}/sendMessage"
 }
@@ -1861,7 +1873,7 @@ send_gotify_notification() {
         '{"title":$t,"message":$m,"priority":5}')
     # No -L: Gotify URLs typically embed the token as ?token=...; a redirect
     # to another host would leak it.
-    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$url"
 }
 
@@ -1872,7 +1884,7 @@ send_ntfy_notification() {
     local -a hdrs=(-H "User-Agent: Hoist" -H "Title: $title" -H "Priority: default")
     [[ -n $token ]] && hdrs+=(-H "Authorization: Bearer $token")
     # No -L: ntfy bearer token in Authorization header would leak on redirect.
-    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         "${hdrs[@]}" -d "$message" "$url"
 }
 
@@ -1886,7 +1898,7 @@ send_teams_notification() {
           "summary":$t,"themeColor":"0076D7","title":$t,"text":$m}')
     # No -L: Teams webhook URL is itself a credential; following redirects
     # to a different host risks exposing it.
-    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
         -H "User-Agent: Hoist" -H "Content-Type: application/json" -d "$payload" "$webhook"
 }
 
@@ -1900,7 +1912,7 @@ send_matrix_notification() {
     url="${homeserver%/}/_matrix/client/v3/rooms/${room_id}/send/m.room.message/${txn}"
     payload=$(jq -n --arg body "$message" '{"msgtype":"m.text","body":$body}')
     # No -L: Matrix access token in Authorization header would leak on redirect.
-    curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
+    curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 -X PUT \
         -H "User-Agent: Hoist" -H "Authorization: Bearer ${token}" \
         -H "Content-Type: application/json" -d "$payload" "$url"
 }
@@ -1911,7 +1923,7 @@ _hc_ping() {
     local suffix="${1:-}" url="${HEALTHCHECKS_PING_URL%/}"
     [[ -n $suffix ]] && url="${url}/${suffix}"
     # No -L: the URL contains a check UUID that acts as a credential.
-    curl -fsS --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
+    curl -fsS --proto '=http,https' --max-time 10 -H "User-Agent: Hoist" "$url" >/dev/null 2>&1 || true
 }
 
 # _skip_for_rollup <channel>  -> 0 if per-container send should be skipped
@@ -1979,7 +1991,7 @@ send_rollup_notifications() {
                 payload=$(jq -n --arg type "rollup" --arg ts "$(_iso_ts)" --arg msg "$message" \
                     '{"type":$type,"timestamp":$ts,"message":$msg}')
                 # No -L: generic webhook URL is itself a credential.
-                curl -fsS --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
+                curl -fsS --proto '=http,https' --max-time "$CURL_TIMEOUT" --connect-timeout 10 \
                     -H "User-Agent: Hoist" -H "Content-Type: application/json" \
                     -d "$payload" "$GLOBAL_GENERIC_WEBHOOK" || true ;;
             telegram)
@@ -2168,6 +2180,15 @@ process_container() {
             if [[ "$hoist_registry_authfile" != /* ]]; then
                 log "$container_name: Skipping registry login — authfile path is not absolute: $hoist_registry_authfile"
             elif [[ -f "$hoist_registry_authfile" ]]; then
+                # The authfile holds a plaintext registry password; warn loudly
+                # if it's readable beyond its owner so a misconfigured 0644 file
+                # doesn't leak credentials to every local user unnoticed.
+                local _auth_perm
+                _auth_perm=$(stat -c '%a' "$hoist_registry_authfile" 2>/dev/null \
+                    || stat -f '%Lp' "$hoist_registry_authfile" 2>/dev/null)
+                if [[ -n $_auth_perm && $(( 8#$_auth_perm & 0077 )) -ne 0 ]]; then
+                    log "$container_name: Warning: authfile $hoist_registry_authfile is group/world-accessible (mode $_auth_perm) — chmod 600 it"
+                fi
                 log "$container_name: Registry login..."
                 if [[ $DRY_RUN != true ]]; then
                     local _auth_user _auth_pass _auth_reg

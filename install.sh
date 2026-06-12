@@ -41,6 +41,12 @@ _sudo_if_needed() {
     while [[ ! -e "$probe" && "$probe" != "/" ]]; do
         probe="$(dirname "$probe")"
     done
+    # Refuse to operate beneath a symlinked ancestor: a symlinked install dir
+    # could silently redirect a privileged write (install/mkdir) to an
+    # attacker-chosen location.
+    if [[ -L "$probe" ]]; then
+        err "refusing to act under symlinked path component: $probe (target: $target)"
+    fi
     if [[ -w "$probe" ]]; then
         "$@" || err "step failed (target: $target): $*"
     elif command -v sudo >/dev/null 2>&1; then
