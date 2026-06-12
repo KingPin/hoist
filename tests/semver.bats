@@ -30,22 +30,38 @@ setup() {
     _semver_satisfies "~1.2.3" "1.2.9"
 }
 
-@test "_semver_satisfies: tilde blocks a minor bump (BUG: fixed in Phase 1)" {
-    skip "tilde constraint is non-functional — case pattern '~)' undergoes tilde expansion; fixed with the Phase 1 semver work"
+@test "_semver_satisfies: tilde blocks a minor bump" {
     ! _semver_satisfies "~1.2.3" "1.3.0"
     ! _semver_satisfies "~1.2.3" "2.0.0"
 }
 
-@test "_semver_satisfies: v-prefixed versions (BUG: fixed in Phase 1)" {
-    skip "v-prefix collapses to major 0; fixed in Phase 1"
+@test "_semver_satisfies: v-prefixed versions" {
     _semver_satisfies "^1.0.0" "v1.5.0"
     ! _semver_satisfies "<2.0.0" "v3.0.0"
+    _semver_satisfies "^v1.0.0" "1.5.0"
 }
 
-@test "_semver_satisfies: comma range conjunction (BUG: fixed in Phase 1)" {
-    skip "comma ranges silently drop the upper bound; fixed in Phase 1"
+@test "_semver_satisfies: comma range conjunction" {
     _semver_satisfies ">=0.1.2,<0.2" "0.1.5"
     ! _semver_satisfies ">=0.1.2,<0.2" "0.9.0"
+    ! _semver_satisfies ">=0.1.2,<0.2" "0.1.0"
+    # whitespace around parts is tolerated
+    _semver_satisfies ">=1.0.0, <2.0.0" "1.4.0"
+}
+
+@test "_semver_compare: zero-padded fields do not trip octal arithmetic" {
+    [[ $(_semver_compare "1.08.0" "1.9.0") == -1 ]]
+    [[ $(_semver_compare "1.09.0" "1.09.0") == 0 ]]
+}
+
+@test "_semver_compare: release outranks pre-release at equal triple" {
+    [[ $(_semver_compare "1.0.0" "1.0.0-rc.1") == 1 ]]
+    [[ $(_semver_compare "1.0.0-rc.1" "1.0.0") == -1 ]]
+}
+
+@test "_semver_satisfies: pre-release below the >= boundary is excluded" {
+    ! _semver_satisfies ">=1.0.0" "1.0.0-rc.1"
+    _semver_satisfies "<1.0.0" "1.0.0-rc.1"
 }
 
 @test "_semver_satisfies: comparison operators" {

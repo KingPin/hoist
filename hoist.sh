@@ -261,40 +261,65 @@ validate_script_path() {
     [[ -x "$path" ]] || { log "SECURITY: script path is not executable: $path"; return 1; }
 }
 
-_semver_gt() {
+# _semver_compare <a> <b>  -> echoes -1 / 0 / 1 for a<b, a==b, a>b.
+# Numeric base-10 comparison (no octal traps on zero-padded fields) and
+# pre-release aware: with equal numeric triples a release outranks a
+# pre-release (1.0.0 > 1.0.0-rc.1), per semver §11.
+_semver_compare() {
+    local a_full="$1" b_full="$2"
     local IFS=.
-    local -a a=($1) b=($2)
+    local -a a=(${a_full%%-*}) b=(${b_full%%-*})
+    local i av bv
     for i in 0 1 2; do
-        local av=${a[i]:-0} bv=${b[i]:-0}
-        av=${av%%[!0-9]*}   # strip pre-release suffix (e.g. "1-rc.1" -> "1")
-        bv=${bv%%[!0-9]*}
-        [[ $av -gt $bv ]] && return 0
-        [[ $av -lt $bv ]] && return 1
+        av=${a[i]:-0}; bv=${b[i]:-0}
+        av=${av%%[!0-9]*}; bv=${bv%%[!0-9]*}   # drop any trailing non-digits
+        av=$((10#${av:-0})); bv=$((10#${bv:-0}))
+        ((av > bv)) && { echo 1; return; }
+        ((av < bv)) && { echo -1; return; }
     done
-    return 1
+    local pa="" pb=""
+    [[ $a_full == *-* ]] && pa=${a_full#*-}
+    [[ $b_full == *-* ]] && pb=${b_full#*-}
+    if [[ -z $pa && -n $pb ]]; then echo 1; return; fi   # release > pre-release
+    if [[ -n $pa && -z $pb ]]; then echo -1; return; fi  # pre-release < release
+    echo 0
 }
 
-# 0 if a == b, ignoring pre-release suffixes
-_semver_eq() {
-    local IFS=.
-    local -a a=($1) b=($2)
-    for i in 0 1 2; do
-        local av=${a[i]:-0} bv=${b[i]:-0}
-        av=${av%%[!0-9]*}; bv=${bv%%[!0-9]*}
-        [[ $av != "$bv" ]] && return 1
-    done
-    return 0
-}
+# 0 (true) if a > b
+_semver_gt() { [[ $(_semver_compare "$1" "$2") == 1 ]]; }
+
+# 0 (true) if a == b (numeric triple + pre-release rank)
+_semver_eq() { [[ $(_semver_compare "$1" "$2") == 0 ]]; }
 
 # _semver_satisfies <constraint> <version>  -> 0 if version satisfies constraint
-# Supports: ^X.Y.Z (same major), ~X.Y.Z (same major+minor), >=X, <=X, >X, <X, =X, X (exact)
+# Supports: ^X.Y.Z (same major), ~X.Y.Z (same major+minor), >=X, <=X, >X, <X,
+# =X, X (exact), comma-separated conjunctions (every part must hold), and an
+# optional leading v/V on both the constraint and the candidate version.
 _semver_satisfies() {
     local constraint="$1" version="$2"
     [[ -z $version ]] && return 0   # no version label = can't enforce, fail-open
+    version="${version#[vV]}"
+
+    # Comma-separated parts form a conjunction: every part must be satisfied
+    # (e.g. ">=0.1.2,<0.2" pins the 0.1.x line).
+    if [[ $constraint == *,* ]]; then
+        local part
+        local IFS=,
+        for part in $constraint; do
+            part="${part#"${part%%[![:space:]]*}"}"   # ltrim
+            part="${part%"${part##*[![:space:]]}"}"    # rtrim
+            [[ -z $part ]] && continue
+            _semver_satisfies "$part" "$version" || return 1
+        done
+        return 0
+    fi
+
     local op base
+    # Patterns are single-quoted so bash does not tilde-expand '~' (which would
+    # turn the arm into $HOME and silently never match).
     case "$constraint" in
-        ^*)  op="^"; base="${constraint#^}" ;;
-        ~*)  op="~"; base="${constraint#~}" ;;
+        '^'*)  op="^";  base="${constraint#\^}" ;;
+        '~'*)  op="~";  base="${constraint#\~}" ;;
         ">="*) op=">="; base="${constraint#>=}" ;;
         "<="*) op="<="; base="${constraint#<=}" ;;
         ">"*)  op=">";  base="${constraint#>}" ;;
@@ -302,12 +327,14 @@ _semver_satisfies() {
         "="*)  op="=";  base="${constraint#=}" ;;
         *)     op="=";  base="$constraint" ;;
     esac
+    base="${base#[vV]}"
     local IFS=.
-    local -a c=($base) v=($version)
+    local -a c=(${base%%-*}) v=(${version%%-*})
+    # Arms quoted so '~' (and '^') are matched literally, not tilde-expanded.
     case "$op" in
-        ^)  [[ ${v[0]:-0} == "${c[0]:-0}" ]] || return 1
+        '^')  [[ ${v[0]:-0} == "${c[0]:-0}" ]] || return 1
             _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
-        ~)  [[ ${v[0]:-0} == "${c[0]:-0}" && ${v[1]:-0} == "${c[1]:-0}" ]] || return 1
+        '~')  [[ ${v[0]:-0} == "${c[0]:-0}" && ${v[1]:-0} == "${c[1]:-0}" ]] || return 1
             _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
         ">=") _semver_gt "$version" "$base" || _semver_eq "$version" "$base" ;;
         "<=") ! _semver_gt "$version" "$base" ;;
