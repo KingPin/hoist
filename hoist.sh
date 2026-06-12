@@ -32,8 +32,12 @@ HOIST_HOSTNAME=""
 VERBOSE=false
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 UPDATE_CHECK="${UPDATE_CHECK:-notify}"
+# Self-update API check is cached this many seconds so cron-fired runs don't hit
+# the GitHub API every time. --force-update-check bypasses it for one run.
+UPDATE_CHECK_CACHE_TTL="${UPDATE_CHECK_CACHE_TTL:-21600}"   # 6h
 DO_SELF_UPDATE=false
 FORCE=false
+FORCE_UPDATE_CHECK=false
 DO_LIST=false
 DO_CRON=false
 CRON_ACTION=""
@@ -99,6 +103,7 @@ while [[ "$1" != "" ]]; do
     --update)     DO_SELF_UPDATE=true ;;
     --version)    echo "hoist v${HOIST_VERSION}"; exit 0 ;;
     --force)      FORCE=true ;;
+    --force-update-check) FORCE_UPDATE_CHECK=true ;;
     --list|--status) DO_LIST=true ;;
     --only=*)     ONLY_LIST="${1#*=}"
                   [[ -n $ONLY_LIST ]] || { echo "Error: --only requires a value" >&2; exit 2; } ;;
@@ -156,6 +161,8 @@ Options:
   --exclude <names>  Comma-separated container names to exclude
   --update           Self-update hoist to the latest GitHub release
   --force            With --update, reinstall even if already up to date
+  --force-update-check  Ignore the cached self-update check and query the
+                     GitHub API now (the check is otherwise cached for 6h)
   --version          Print version and exit
   -h, --help, -?     Show this help and exit
 
@@ -819,6 +826,21 @@ _self_update_check() {
     local timeout_arg=5
     [[ $interactive == true ]] && timeout_arg=15
 
+    local _check_cache="${CACHE_LOCATION}/hoist-self-update-check.cache"
+
+    # Automated runs honour a cached check so a cron/timer-fired hoist doesn't
+    # hit the GitHub API on every invocation. --force-update-check bypasses it
+    # for one run; interactive --update always queries live.
+    if [[ $interactive == false && $FORCE_UPDATE_CHECK != true && -r $_check_cache ]]; then
+        local _last_check _now
+        _last_check=$(awk 'NR==1{print $1}' "$_check_cache" 2>/dev/null)
+        _now=$(date +%s)
+        if [[ $_last_check =~ ^[0-9]+$ ]] && (( _now - _last_check < UPDATE_CHECK_CACHE_TTL )); then
+            [[ $VERBOSE == true ]] && log "Self-update check skipped (checked $(( (_now - _last_check) / 60 ))m ago; cache TTL $(( UPDATE_CHECK_CACHE_TTL / 60 ))m)"
+            return 0
+        fi
+    fi
+
     local api_response _api_raw _http_code
     _api_raw=$(curl -sSL --proto '=https' -w '\n%{http_code}' \
         --max-time "$timeout_arg" --connect-timeout 5 \
@@ -855,6 +877,15 @@ _self_update_check() {
         return 0
     }
     latest_version="${latest_tag#v}"
+
+    # Record this successful check so the next automated run can skip the API.
+    # A live interactive check also refreshes the window.
+    if _state_path_safe "$_check_cache"; then
+        if ! ( umask 177 && printf '%s %s\n' "$(date +%s)" "$latest_version" > "$_check_cache" ); then
+            [[ $VERBOSE == true ]] && log "Warning: could not write update-check cache ${_check_cache}"
+        fi
+    fi
+
     release_url=$(jq -r '.html_url // empty' <<< "$api_response")
     [[ -z $release_url ]] && release_url="https://github.com/${HOIST_REPO}/releases/tag/v${latest_version}"
     asset_url=$(jq -r '.assets[] | select(.name == "hoist.sh") | .browser_download_url' <<< "$api_response")
