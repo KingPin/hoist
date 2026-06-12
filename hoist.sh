@@ -1270,11 +1270,17 @@ EOF
 # Decide whether to pin DOCKER_HOST into the user unit.
 # Returns the value to pin on stdout, or empty if no pin is needed.
 # Precedence: explicit --docker-host flag wins. Otherwise auto-detect: pin
-# only when DOCKER_HOST is set in the caller's env (so we know the user
-# relies on it) AND the user manager doesn't already have it AND no docker
-# context is steering the connection. This covers the common rootless-docker
-# case where DOCKER_HOST lives in ~/.zshrc / ~/.bashrc and would silently
-# disappear under a systemd --user timer.
+# when DOCKER_HOST is set in the caller's env (so we know the user relies on
+# it) AND the user manager doesn't already have it. This covers the common
+# rootless-docker case where DOCKER_HOST lives in ~/.zshrc / ~/.bashrc and
+# would silently disappear under a systemd --user timer.
+#
+# We deliberately pin even when a non-default docker context is also set:
+# docker's own resolution order puts DOCKER_HOST ahead of the active context,
+# so the interactive shell is already talking to $DOCKER_HOST. Skipping the
+# pin would let the timer-fired run fall back to the context and target a
+# different daemon than the user sees. Context-only setups never set
+# DOCKER_HOST and keep working via ~/.docker/config.json.
 _detect_user_docker_host() {
     if [[ -n ${CRON_DOCKER_HOST_FLAG:-} ]]; then
         printf '%s' "$CRON_DOCKER_HOST_FLAG"
@@ -1284,9 +1290,6 @@ _detect_user_docker_host() {
     if systemctl --user show-environment 2>/dev/null | grep -q '^DOCKER_HOST='; then
         return 0
     fi
-    local ctx
-    ctx=$(docker context show 2>/dev/null || true)
-    [[ -z $ctx || $ctx == default ]] || return 0
     printf '%s' "$DOCKER_HOST"
 }
 
@@ -1651,22 +1654,50 @@ _cron_remove_orchestrate() {
 
 _cron_print_orchestrate() {
     local backend="${CRON_BACKEND_FLAG:-}"
+    local scope="${CRON_SCOPE_FLAG:-}"
     local detected; detected=$(_detect_scheduler)
-    if [[ -n $backend ]]; then
-        if [[ $backend != cron && $backend != systemd ]]; then
-            log "Error: --backend must be 'cron' or 'systemd' (got: $backend)"; return 1
+
+    if [[ -n $backend && $backend != cron && $backend != systemd ]]; then
+        log "Error: --backend must be 'cron' or 'systemd' (got: $backend)"; return 1
+    fi
+    if [[ -n $scope && $scope != user && $scope != system ]]; then
+        log "Error: --scope must be 'user' or 'system' (got: $scope)"; return 1
+    fi
+    if [[ -n ${CRON_DOCKER_HOST_FLAG:-} && $scope != user ]]; then
+        log "Error: --docker-host is only supported with --scope user."; return 1
+    fi
+
+    local schedule_input="${CRON_SCHEDULE_FLAG:-hourly}"
+    local hoist_bin; hoist_bin=$(_resolve_hoist_path) || return 1
+
+    # ---- user scope: systemd --user only (mirrors _systemd_user_backend_install) ----
+    if [[ $scope == user ]]; then
+        if [[ $backend == cron ]]; then
+            log "Error: --backend cron is not supported with --scope user."; return 1
         fi
-    else
+        local schedule_expr
+        schedule_expr=$(_cron_render_schedule systemd "$schedule_input") || return 1
+        local pinned_docker_host env_lines=""
+        pinned_docker_host=$(_detect_user_docker_host)
+        [[ -n $pinned_docker_host ]] && env_lines="Environment=DOCKER_HOST=${pinned_docker_host}"$'\n'
+        echo "# === ${_CRON_SYSTEMD_USER_SERVICE} ==="
+        _systemd_render_service_user "$hoist_bin" "$env_lines"
+        echo
+        echo "# === ${_CRON_SYSTEMD_USER_TIMER} ==="
+        _systemd_render_timer_user "$schedule_expr"
+        return 0
+    fi
+
+    # ---- system scope (default) ----
+    if [[ -z $backend ]]; then
         case "$detected" in
             both|systemd) backend=systemd ;;
             cron|none)    backend=cron ;;
             launchd-doc)  _launchd_doc; return 2 ;;
         esac
     fi
-    local schedule_input="${CRON_SCHEDULE_FLAG:-hourly}"
     local run_user="${CRON_USER_FLAG:-root}"
-    local hoist_bin schedule_expr
-    hoist_bin=$(_resolve_hoist_path) || return 1
+    local schedule_expr
     schedule_expr=$(_cron_render_schedule "$backend" "$schedule_input") || return 1
     case "$backend" in
         cron)
