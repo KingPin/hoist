@@ -1952,6 +1952,19 @@ _skip_for_rollup() {
     esac
 }
 
+# _dispatch_notification <channel> <label> <sender-fn> [args...]
+# Single per-channel dispatch path: honors rollup routing (_skip_for_rollup),
+# emits the standard log line, then invokes the sender. The caller gates on
+# credential presence before calling. Reads container_name from the enclosing
+# process_container frame via bash dynamic scope (same mechanism the parallel
+# worker pool relies on).
+_dispatch_notification() {
+    local channel="$1" label="$2"; shift 2
+    _skip_for_rollup "$channel" && return 0
+    log "$container_name: Sending $label notification..."
+    "$@"
+}
+
 # write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
 write_rollup_entry() {
     [[ $WEBHOOK_ROLLUP == true ]] || return 0
@@ -2386,43 +2399,48 @@ process_container() {
                     "${hoist_script_notify[@]}"
                 fi
                 local _slack_msg="[$container_name] $status: $image_name"
-                if [[ -n $effective_discord ]] && ! _skip_for_rollup discord; then
-                    log "$container_name: Sending Discord notification..."
-                    send_discord_notification "$status" "$container_name" \
+                # Per-channel dispatch: each block gates on credential presence,
+                # then _dispatch_notification applies the rollup-skip check and
+                # the standard log line. Senders' signatures differ too much for
+                # a string-keyed table to hold them, so the credential guards
+                # stay inline and readable.
+                if [[ -n $effective_discord ]]; then
+                    _dispatch_notification discord Discord \
+                        send_discord_notification "$status" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_discord" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}" "$color"
                 fi
-                if [[ -n $effective_generic ]] && ! _skip_for_rollup generic; then
-                    log "$container_name: Sending generic webhook..."
-                    send_generic_webhook "$status_generic" "$container_name" \
+                if [[ -n $effective_generic ]]; then
+                    _dispatch_notification generic "generic webhook" \
+                        send_generic_webhook "$status_generic" "$container_name" \
                         "$old_oci_version" "$new_oci_version" "$image_name" \
                         "$effective_generic" "$old_oci_revision" "$new_oci_revision" \
                         "${container_image_digest#sha256:}" "${image_digest#sha256:}"
                 fi
-                if [[ -n $effective_slack ]] && ! _skip_for_rollup slack; then
-                    log "$container_name: Sending Slack notification..."
-                    send_slack_notification "$_slack_msg" "$effective_slack"
+                if [[ -n $effective_slack ]]; then
+                    _dispatch_notification slack Slack \
+                        send_slack_notification "$_slack_msg" "$effective_slack"
                 fi
-                if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]] && ! _skip_for_rollup telegram; then
-                    log "$container_name: Sending Telegram notification..."
-                    send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
+                if [[ -n $effective_telegram_bot_token && -n $effective_telegram_chat_id ]]; then
+                    _dispatch_notification telegram Telegram \
+                        send_telegram_notification "$_slack_msg" "$effective_telegram_bot_token" "$effective_telegram_chat_id"
                 fi
-                if [[ -n $effective_gotify_url ]] && ! _skip_for_rollup gotify; then
-                    log "$container_name: Sending Gotify notification..."
-                    send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
+                if [[ -n $effective_gotify_url ]]; then
+                    _dispatch_notification gotify Gotify \
+                        send_gotify_notification "$status" "$_slack_msg" "$effective_gotify_url"
                 fi
-                if [[ -n $effective_ntfy_url ]] && ! _skip_for_rollup ntfy; then
-                    log "$container_name: Sending ntfy notification..."
-                    send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
+                if [[ -n $effective_ntfy_url ]]; then
+                    _dispatch_notification ntfy ntfy \
+                        send_ntfy_notification "$status" "$_slack_msg" "$effective_ntfy_url" "$effective_ntfy_token"
                 fi
-                if [[ -n $effective_teams_webhook ]] && ! _skip_for_rollup teams; then
-                    log "$container_name: Sending Teams notification..."
-                    send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
+                if [[ -n $effective_teams_webhook ]]; then
+                    _dispatch_notification teams Teams \
+                        send_teams_notification "$status" "$_slack_msg" "$effective_teams_webhook"
                 fi
-                if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]] && ! _skip_for_rollup matrix; then
-                    log "$container_name: Sending Matrix notification..."
-                    send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
+                if [[ -n $effective_matrix_homeserver && -n $effective_matrix_room_id && -n $effective_matrix_token ]]; then
+                    _dispatch_notification matrix Matrix \
+                        send_matrix_notification "$_slack_msg" "$effective_matrix_homeserver" \
                         "$effective_matrix_room_id" "$effective_matrix_token"
                 fi
                 write_rollup_entry "$status_generic" "$container_name" "$image_name" \
