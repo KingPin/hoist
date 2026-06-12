@@ -210,9 +210,25 @@ if [[ -z ${BASH_VERSINFO+x} ]] || (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] =
     exit 1
 fi
 
-# Tear down only the background workers we spawned, not the entire process
-# group — `kill 0` would also signal shell siblings (e.g. the cron parent).
-trap '_jobs=$(jobs -p); [[ -n "$_jobs" ]] && kill $_jobs 2>/dev/null; exit 130' INT TERM
+# On INT/TERM tear down the workers we spawned and their docker/curl children,
+# but never the whole process group — `kill 0` would also signal shell siblings
+# such as the cron parent. pkill -P reaches each worker's descendants (best
+# effort; absent on minimal hosts). Exit with 128+signum so the caller observes
+# the real signal (130 for INT, 143 for TERM) instead of a flat code.
+_on_signal() {
+    local signum="$1" _jobs _j
+    trap - INT TERM   # disarm so a second signal can't re-enter the handler
+    _jobs=$(jobs -p)
+    if [[ -n "$_jobs" ]]; then
+        for _j in $_jobs; do
+            command -v pkill >/dev/null 2>&1 && pkill -TERM -P "$_j" 2>/dev/null
+            kill "$_j" 2>/dev/null
+        done
+    fi
+    exit $((128 + signum))
+}
+trap '_on_signal 2' INT
+trap '_on_signal 15' TERM
 
 if [[ $DO_CRON != true ]]; then
     [[ -x "$DOCKER_BINARY" ]] || { echo "Error: docker binary not found: ${DOCKER_BINARY:-docker}"; exit 1; }
@@ -290,6 +306,9 @@ check_maintenance_window() {
         log "Within maintenance window ($MAINTENANCE_WINDOW), proceeding."
     else
         log "Outside maintenance window ($MAINTENANCE_WINDOW), skipping."
+        # Ping success so Healthchecks.io sees an intentional no-op run rather than
+        # a missed check (the early exit is before the normal end-of-run ping).
+        _hc_ping
         exit 0
     fi
 }
@@ -827,9 +846,14 @@ _self_update_check() {
     fi
 
     if ! _semver_gt "$latest_version" "$HOIST_VERSION"; then
-        if [[ $interactive == true ]]; then log "Already up to date (v${HOIST_VERSION})"; exit 0; fi
-        [[ $VERBOSE == true ]] && log "hoist is up to date (v${HOIST_VERSION})"
-        return 0
+        if [[ $interactive == true && $force == true ]]; then
+            log "Already at v${HOIST_VERSION} — reinstalling latest (forced)"
+        elif [[ $interactive == true ]]; then
+            log "Already up to date (v${HOIST_VERSION}) — use --force to reinstall"; exit 0
+        else
+            [[ $VERBOSE == true ]] && log "hoist is up to date (v${HOIST_VERSION})"
+            return 0
+        fi
     fi
 
     local sentinel="${CACHE_LOCATION}/hoist-self-v${latest_version}.notified"
