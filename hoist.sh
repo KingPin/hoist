@@ -960,9 +960,29 @@ _cron_preset_to_systemd() {
 }
 
 _validate_cron_expr() {
-    local expr="$1" n
-    n=$(awk '{print NF}' <<< "$expr")
-    [[ $n -eq 5 ]] || { echo "Error: cron expression must have exactly 5 fields (got $n): $expr" >&2; return 1; }
+    local expr="$1"
+    # Reject embedded newlines / carriage returns first: a multi-line value could
+    # smuggle additional crontab lines into the generated /etc/cron.d/hoist.
+    if [[ $expr == *$'\n'* || $expr == *$'\r'* ]]; then
+        echo "Error: cron expression must be a single line: $expr" >&2; return 1
+    fi
+    # Accept the standard vixie-cron @-shortcuts.
+    case "$expr" in
+        @reboot|@yearly|@annually|@monthly|@weekly|@daily|@midnight|@hourly) return 0 ;;
+    esac
+    local -a fields
+    read -ra fields <<< "$expr"
+    [[ ${#fields[@]} -eq 5 ]] || { echo "Error: cron expression must have exactly 5 fields (got ${#fields[@]}): $expr" >&2; return 1; }
+    # Per-field grammar: comma-separated terms, each a '*', a number or numeric
+    # range, or a 3-letter name/range (MON-FRI, JAN), with an optional '/step'.
+    # Numeric-only setups and named ranges both pass; anything else is rejected
+    # rather than written verbatim into the crontab.
+    local term='(\*|[0-9]+(-[0-9]+)?|[A-Za-z]{3}(-[A-Za-z]{3})?)(/[0-9]+)?'
+    local field_re="^${term}(,${term})*$"
+    local f
+    for f in "${fields[@]}"; do
+        [[ $f =~ $field_re ]] || { echo "Error: invalid cron field '$f' in: $expr" >&2; return 1; }
+    done
     return 0
 }
 
