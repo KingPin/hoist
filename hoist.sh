@@ -426,18 +426,31 @@ _rollback_container() {
         log "$container: rollback failed — old image $old_sha no longer present locally (was it pruned?)"
         return 1
     fi
+    if [[ ! -d $workdir ]]; then
+        log "$container: rollback failed — compose workdir '$workdir' is missing"
+        return 1
+    fi
+    # Remember what the tag currently points at so a failed rollback can be
+    # restored rather than leaving the tag aliased to an image that was never
+    # brought up.
+    local prev_target
+    prev_target=$("${DOCKER_BINARY}" image inspect --format '{{.Id}}' "$image_name" 2>/dev/null)
     log "$container: rolling back to $old_sha"
     if ! "${DOCKER_BINARY}" tag "$old_sha" "$image_name"; then
         log "$container: rollback failed — could not re-tag $old_sha as $image_name"
         return 1
     fi
-    if [[ ! -d $workdir ]]; then
-        log "$container: rollback failed — compose workdir '$workdir' is missing"
-        return 1
-    fi
     # Re-run compose up without pulling — picks up the now-aliased image.
-    if ! ( cd "$workdir" && "${DOCKER_BINARY}" compose up -d --no-pull "$service" ) >/dev/null 2>&1; then
-        log "$container: rollback failed — compose up did not succeed"
+    # '--pull never' is the supported flag ('--no-pull' does not exist and made
+    # this path silently fall back to pulling). stderr is captured into the log.
+    local up_err
+    if ! up_err=$( cd "$workdir" && "${DOCKER_BINARY}" compose up -d --pull never "$service" 2>&1 ); then
+        log "$container: rollback failed — compose up did not succeed: ${up_err}"
+        # Undo the re-tag so the tag still reflects what is actually running.
+        if [[ -n $prev_target ]]; then
+            "${DOCKER_BINARY}" tag "$prev_target" "$image_name" >/dev/null 2>&1 \
+                || log "$container: warning — could not restore tag $image_name to $prev_target"
+        fi
         return 1
     fi
     log "$container: rollback complete"
