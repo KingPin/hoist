@@ -19,23 +19,27 @@ bash hoist.sh [--tag <tag>] [--dry-run] [--parallel <N>] [--list] [--update]
 ```
 
 - `--tag` filters which label set to act on (e.g. `--tag nightly` reads `com.sumguy.hoist.nightly.*` labels)
-- `--dry-run` shows what would be pulled/updated without making any changes or sending notifications (implies `--verbose`)
+- `--dry-run` reports which containers are *eligible* to update/notify without pulling, recreating, or notifying — fully read-only (implies `--verbose`)
 - `--verbose` logs containers skipped for missing hoist labels
-- `--parallel N` uses `xargs -P N` to process containers concurrently
+- `--parallel N` uses a bash worker pool (`process_container "$c" &` + `wait -n`) to process containers concurrently
 - `--list` / `--status` prints a table of running containers + their hoist labels and cached digest, then exits before any pulls
-- `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--version` prints `HOIST_VERSION` and exits
+- `--update` triggers interactive self-update from the latest GitHub release; `--force` skips the prompt; `--force-update-check` ignores the 6h self-update-check cache for one run; `--version` prints `HOIST_VERSION` and exits
 - `--cron <action>` manages a scheduled run; actions are `install | remove | print | status`. Bare `--cron` opens an interactive menu. Non-interactive runs of `install` need `--schedule <preset|expr>` and, for system scope, `--user <name>` (and `--backend cron|systemd` if both are present). Non-root users are also asked `--scope user|system`; root always defaults to system scope. `--docker-host <uri>` is an optional override for user-scope installs that pins `DOCKER_HOST` into the generated unit (use when the calling shell doesn't have `DOCKER_HOST` set, or to override auto-detect).
 
 ## Architecture
 
-The script processes all running Docker containers in a single pass:
+The script processes all running Docker containers in a single pass. After taking an exclusive run lock (`_acquire_run_lock`, see below), it discovers containers via `docker ps`, then runs each through `process_container`.
 
-1. **Maintenance window check** — if `MAINTENANCE_WINDOW` is set in config and the current time is outside the window, exits cleanly (0) before doing anything; `--dry-run` bypasses this
-2. **Container discovery** — `docker ps` lists all running containers
-3. **Label inspection** — one `docker inspect` call per container, all fields extracted via `jq` in one pass
-4. **Image pull** — `docker compose pull` via `compose_pull_wrapper`
-5. **Update/notify decision** — compares the pulled image digest against the running container's digest; acts only if they differ
-6. **Action** — either `compose_up_wrapper` (recreate container) or webhook/script notification
+`process_container` (`hoist.sh:2495`) is a slim orchestrator: it declares the per-container locals and calls six single-responsibility helpers that populate/read those locals through bash's dynamic scope (the same mechanism the `&`-spawned parallel worker pool relies on), so ~40 metadata/status values aren't threaded through argument lists:
+
+1. **`_get_container_metadata`** (`hoist.sh:2102`) — one `docker inspect` per container, all fields extracted via `jq` (NUL-delimited) in one pass; validates script paths. Appends `update_failed` + returns 1 on inspect/parse failure.
+2. **`_registry_login`** (authfile-based `docker login`; side-effect only)
+3. **`_pull_and_compare_digest`** (`hoist.sh:2252`) — in `--dry-run` this is fully read-only (NO pull): it sets `would_update`/`would_notify` and returns. Live: `docker compose pull` via `compose_pull_wrapper`, then `docker image inspect` for the new digest. Appends `update_failed` + writes the group `.failed` flag on pull failure.
+4. **`_evaluate_policies`** (`hoist.sh:2311`) — constraint pin + group-abort gates (tokens `constraint_blocked`, `group_aborted`)
+5. **`_apply_update`** (`hoist.sh:2346`) — acts only if the pulled digest differs and no policy blocked: `script.update`, `compose_up_wrapper`, healthcheck wait, rollback on failure
+6. **`_dispatch_notifications`** (`hoist.sh:2421`) — dedup-digest check, `script.notify`, per-channel sends, rollup, persist `.notified`
+
+`process_container` owns the result-file writes and the early returns (dedup, pause).
 
 ### Label namespace
 
@@ -61,7 +65,7 @@ All behavior is controlled by Docker labels on containers:
 | `com.sumguy.hoist[.TAG].group` | Free-form group name. Any member's pull failure writes `${CACHE_LOCATION}/hoist-group-<group>.failed` and aborts updates for the rest (token: `group_aborted`). Soft atomicity under `--parallel`: a sibling may finish before its peer fails |
 | `com.sumguy.hoist[.TAG].healthcheck.wait` | `true` to poll `docker inspect .State.Health.Status` after `compose up`. On `unhealthy`/`exited`/timeout: emits `unhealthy` token and triggers rollback if enabled. **Caveat:** if the image defines no `HEALTHCHECK`, this falls back to `.State.Status` — only `running` vs `exited` are observable, not real health. A warning is logged in that case |
 | `com.sumguy.hoist[.TAG].healthcheck.timeout` | Per-container override of `HEALTHCHECK_TIMEOUT` (seconds). Polls every `HEALTHCHECK_INTERVAL` seconds (default 2) |
-| `com.sumguy.hoist[.TAG].rollback` | `true` re-aliases the prior image SHA back onto the original tag and re-runs `compose up --no-pull` on update failure or unhealthy. Old SHA must still be present locally — `PRUNE_IMAGES=true` may remove it (token: `rollback_failed`). Tokens: `rolled_back`, `rollback_failed`. Default from config `ROLLBACK_DEFAULT` (default `false`) |
+| `com.sumguy.hoist[.TAG].rollback` | `true` re-aliases the prior image SHA back onto the original tag and re-runs `compose up --pull never` on update failure or unhealthy. Old SHA must still be present locally — `PRUNE_IMAGES=true` may remove it (token: `rollback_failed`). Tokens: `rolled_back`, `rollback_failed`. Default from config `ROLLBACK_DEFAULT` (default `false`) |
 
 A container can have both `update` and `notify` set — it will update AND send notifications.
 
@@ -71,7 +75,11 @@ Notification state is persisted in `${CACHE_LOCATION}/hoist-<safe-name>.notified
 
 ### Run summary
 
-Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `would_update`, `would_notify`, `paused`, `constraint_blocked`, `group_aborted`, `unhealthy`, `rolled_back`, `rollback_failed`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files (and `hoist-group-*.failed` flags) are wiped at the start of each run. The end-of-run Healthchecks.io ping is `/fail` if any container produced `update_failed`, `unhealthy`, or `rollback_failed`; otherwise success.
+Each `process_container` invocation appends outcome tokens (`updated`, `update_failed`, `notified`, `no_change`, `skipped`, `not_compose_managed`, `would_update`, `would_notify`, `paused`, `constraint_blocked`, `group_aborted`, `unhealthy`, `rolled_back`, `rollback_failed`) to `${CACHE_LOCATION}/hoist-<safe-name>.run-result`. After all containers finish, `print_summary` aggregates them into a single one-line summary. Result files (and `hoist-group-*.failed` flags) are wiped at the start of each run. The end-of-run Healthchecks.io ping is `/fail` if any container produced `update_failed`, `unhealthy`, or `rollback_failed`; otherwise success. **`not_compose_managed`** flags a container with hoist `update`/`notify` labels but no `com.docker.compose.*` metadata — it's logged unconditionally and can't be acted on.
+
+### Run lock and exit code
+
+`_acquire_run_lock` (`hoist.sh:406`) takes an exclusive `flock` on `${CACHE_LOCATION}/hoist.lock` at startup (with an `mkdir`-plus-stale-PID fallback when `flock` is absent). A second run that finds the lock held logs and exits 0 rather than racing over shared state; `--list`/`--status` skips the lock. After `print_summary`, hoist **exits non-zero** if any container produced `update_failed`, `unhealthy`, or `rollback_failed` (drives `Type=oneshot` systemd, cron `MAILTO`, CI). Boolean gates (`update`/`notify`/`rollback`/`healthcheck.wait`, `ROLLBACK_DEFAULT`) are routed through `_is_true`, which accepts `true|1|yes|on` case-insensitively.
 
 ### Self-update
 
@@ -82,6 +90,8 @@ On every run (unless `UPDATE_CHECK=off`), `_self_update_check` queries the GitHu
 - `off`: skip entirely.
 
 `--update` invokes the same path interactively (prompts before replacing; `--force` skips the prompt; `--dry-run` shows what would happen without writing). HTTP errors are distinguished: `000` = network failure, `404` = no releases yet, other non-200 = API error.
+
+The non-interactive check is cached in `${CACHE_LOCATION}/hoist-self-update-check.cache` (epoch + version) for `UPDATE_CHECK_CACHE_TTL` seconds (default 6h) so cron/timer-fired runs don't hit the API every time. The cache survives the run-start state wipe (its name doesn't match the `.run-result`/`.rollup`/`.failed` globs). `--force-update-check` bypasses it for one run; interactive `--update` always checks live.
 
 ### Release process
 
@@ -101,7 +111,7 @@ When `script.update` or `script.notify` runs, these `HOIST_*` env vars are set:
 
 `--cron <action>` manages hoist's own scheduled run. Actions: `install`, `remove`, `print` (dry-print the unit/crontab to stdout), `status`. Bare `--cron` opens an interactive menu.
 
-Two backends, auto-detected by `_detect_scheduler` (`hoist.sh:486-506`):
+Two backends, auto-detected by `_detect_scheduler` (`hoist.sh:999`):
 
 Two scopes, chosen via `--scope user|system` (non-root users are prompted; root always gets system):
 
@@ -114,7 +124,7 @@ Two scopes, chosen via `--scope user|system` (non-root users are prompted; root 
   - No `User=` directive (user units run as the owning user). No docker dependency in `[Unit]` (user units cannot depend on system units). Timer uses `WantedBy=default.target`.
   - Enabled with `systemctl --user enable --now hoist.timer`.
   - After install, hoist suggests `loginctl enable-linger $USER` if linger is not already set (needed for the timer to survive without an active login session).
-  - **Rootless docker auto-pin**: at install time, `_detect_user_docker_host` checks whether `DOCKER_HOST` is set in the caller's env, *not* already exported into `systemctl --user show-environment`, and no docker context is steering the connection (`docker context show` == `default`). If all three are true, the install bakes `Environment=DOCKER_HOST=<value>` into `hoist.service` so the timer-fired run matches the user's interactive shell. Context-based rootless setups need nothing — they already work via `~/.docker/config.json`.
+  - **Rootless docker auto-pin**: at install time, `_detect_user_docker_host` (`hoist.sh:1316`) checks two things — whether `DOCKER_HOST` is set in the caller's env and is *not* already exported into `systemctl --user show-environment`. If both hold, the install bakes `Environment=DOCKER_HOST=<value>` into `hoist.service` so the timer-fired run matches the user's interactive shell. (It no longer probes `docker context show`.) Context-based rootless setups need nothing — they already work via `~/.docker/config.json`.
   - **Explicit `--docker-host <uri>`** wins over auto-detect. Use when `DOCKER_HOST` isn't set in the calling shell (non-interactive automation, Ansible) or when auto-detect would pick the wrong socket. Only valid with `--scope user`; passing it with system scope errors out. Source is logged as `--docker-host flag` vs `rootless docker detected` so install logs make the origin obvious.
   - If systemd is not available and `--scope user` is requested, hoist prints cron setup instructions and optionally generates the `/etc/cron.d/hoist` file for the user to place manually.
 
@@ -124,7 +134,7 @@ Idempotency is marker-based: every managed file gets `# Managed by hoist --cron 
 
 Privilege handling lives in `_sudo_if_needed`: walks up to the nearest existing ancestor of the target path and only escalates to `sudo` when that path isn't writable. User-scope installs write to `~HOME` and never call `_sudo_if_needed`. Plays cleanly with Ansible `become` and the standalone `install.sh`.
 
-`systemd-analyze` is **only** required when validating a custom `OnCalendar` expression on the systemd backend (`hoist.sh:537-546`). Presets short-circuit validation. macOS targets aren't supported — `_launchd_doc` (`hoist.sh:755-764`) prints a pointer to `docs/scheduling.md` and returns 2.
+`systemd-analyze` is **only** required when validating a custom `OnCalendar` expression on the systemd backend (`hoist.sh:1072-1077`). Presets short-circuit validation. macOS targets aren't supported — `_launchd_doc` (`hoist.sh:1432`) prints a pointer to `docs/scheduling.md` and returns 2.
 
 A worked Ansible playbook that drives `--cron install` through this contract lives in `examples/ansible/`.
 
