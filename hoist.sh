@@ -286,16 +286,18 @@ check_maintenance_window() {
     fi
 }
 
+# The cd runs inside a subshell so the working-directory change never leaks
+# into the caller (which processes many containers across different workdirs).
 compose_pull_wrapper() {
     [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
-    cd "$1" || { log "Error: cannot cd to compose workdir: $1"; return 1; }
-    "${DOCKER_BINARY}" compose pull "$2"
+    ( cd "$1" || { log "Error: cannot cd to compose workdir: $1"; exit 1; }
+      "${DOCKER_BINARY}" compose pull "$2" )
 }
 
 compose_up_wrapper() {
     [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
-    cd "$1" || { log "Error: cannot cd to compose workdir: $1"; return 1; }
-    "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2"
+    ( cd "$1" || { log "Error: cannot cd to compose workdir: $1"; exit 1; }
+      "${DOCKER_BINARY}" compose up -d --always-recreate-deps "$2" )
 }
 
 validate_webhook_url() {
@@ -1978,7 +1980,12 @@ process_container() {
             }
 
             local image_inspect _img_out
-            image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name")
+            image_inspect=$("${DOCKER_BINARY}" image inspect "$image_name" 2>/dev/null) || {
+                log "$container_name: docker image inspect failed for $image_name (image missing after pull?)"
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+                return 1
+            }
             _img_out=$(jq -r '
                 .[0] |
                 .Id,
@@ -1994,6 +2001,14 @@ process_container() {
             image_digest="${_img[0]}"
             new_oci_version="${_img[1]}"
             new_oci_revision="${_img[2]}"
+            # docker prints `[]` for a missing image, so jq succeeds with a null
+            # .Id — guard against an empty digest before any compare/update.
+            if [[ -z $image_digest || $image_digest == null ]]; then
+                log "$container_name: image inspect returned no image ID for $image_name"
+                _tokens+=("update_failed")
+                printf '%s\n' "${_tokens[@]}" >> "$_result_file"
+                return 1
+            fi
         fi
 
         local status="🔄 Update available" status_generic="update_available" color=3447003
@@ -2291,7 +2306,18 @@ if [[ $UPDATE_CHECK != "off" ]]; then
 fi
 
 declare -a containers
-readarray -t containers < <("${DOCKER_BINARY}" ps --format '{{.Names}}' | sort -k1)
+# Capture docker ps separately from the sort so its exit status isn't masked by
+# the pipe — a dead daemon must fail loudly, not look like a 0-container run.
+_ps_out=$("${DOCKER_BINARY}" ps --format '{{.Names}}') || {
+    log "Error: 'docker ps' failed — is the Docker daemon running and is DOCKER_HOST correct?"
+    _hc_ping fail
+    exit 1
+}
+if [[ -z $_ps_out ]]; then
+    containers=()
+else
+    readarray -t containers < <(sort -k1 <<< "$_ps_out")
+fi
 
 # Apply --only / --exclude filters
 if [[ -n "$ONLY_LIST" || -n "$EXCLUDE_LIST" ]]; then
@@ -2362,12 +2388,22 @@ if [[ $DRY_RUN != true && $PRUNE_IMAGES == true ]]; then
     "${DOCKER_BINARY}" image prune --force
 fi
 
-# HC.io ping: /fail if any update_failed / unhealthy / rollback_failed token, success otherwise
+# A run is "failed" if any container emitted update_failed / unhealthy /
+# rollback_failed. This drives both the HC.io ping and the process exit code so
+# cron MAILTO, systemd Type=oneshot, and CI all observe the failure.
+_run_failed=false
 if grep -Elq '^(update_failed|unhealthy|rollback_failed)$' "${CACHE_LOCATION}"/hoist-*.run-result 2>/dev/null; then
+    _run_failed=true
+fi
+
+if [[ $_run_failed == true ]]; then
     _hc_ping fail
 else
     _hc_ping
 fi
+
+[[ $_run_failed == true ]] && exit 1
+exit 0
 }
 
 # Entry point: run only when executed directly, not when sourced (e.g. by the
