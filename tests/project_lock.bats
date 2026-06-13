@@ -35,6 +35,23 @@ setup() {
     [ "$output" = "BEBE" ]
 }
 
+@test "_with_project_lock: refuses a symlinked lock file and does not run the command" {
+    # Pre-plant the lock path as a symlink to a victim file (shared-/tmp attack).
+    # The lock must be refused: the wrapped command never runs and the victim is
+    # left untouched. Key derivation mirrors the function (cksum of the workdir).
+    local key lock target ran
+    key=$(cksum <<< "/srv/evil"); key=${key%% *}
+    lock="${CACHE_LOCATION}/hoist-project-${key}.lock"
+    target="${BATS_TEST_TMPDIR}/victim"
+    : > "$target"
+    ln -s "$target" "$lock"
+    ran="${BATS_TEST_TMPDIR}/ran"
+    run _with_project_lock "/srv/evil" bash -c "echo CLOBBERED > '$target'; : > '$ran'"
+    [ "$status" -ne 0 ]
+    [ ! -f "$ran" ]       # wrapped command never executed
+    [ ! -s "$target" ]    # victim left empty — not clobbered through the symlink
+}
+
 @test "_with_project_lock: different keys run concurrently" {
     # Distinct workdirs must NOT serialize: overlapping execution yields BBEE.
     local trace="${BATS_TEST_TMPDIR}/trace2"

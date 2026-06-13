@@ -356,6 +356,9 @@ _with_project_lock() {
     local key lock rc
     key=$(cksum <<< "$workdir"); key=${key%% *}
     lock="${CACHE_LOCATION}/hoist-project-${key}.lock"
+    # Refuse a planted symlink: the exec-redirect below (and the mkdir fallback)
+    # would otherwise truncate/write through the link target on a shared /tmp.
+    _state_path_safe "$lock" || return 1
     if command -v flock >/dev/null 2>&1; then
         local fd
         exec {fd}>"$lock" || { log "Error: cannot open project lock $lock"; return 1; }
@@ -405,6 +408,11 @@ compose_up_wrapper() {
 # harmless.
 _acquire_run_lock() {
     local lock="${CACHE_LOCATION}/hoist.lock"
+    # A symlink at our lock path is hostile/broken, not a held lock: the
+    # exec-redirect below would truncate the link target on a shared /tmp.
+    # Refuse to run (exit 1) — distinct from the clean exit 0 when the lock is
+    # legitimately held by another run.
+    _state_path_safe "$lock" || exit 1
     if command -v flock >/dev/null 2>&1; then
         exec {_LOCK_FD}>"$lock" || { log "Error: cannot open run lock $lock"; exit 1; }
         if ! flock -n "$_LOCK_FD"; then
