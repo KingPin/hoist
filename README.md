@@ -16,6 +16,12 @@ Copy `hoist.conf.example` to one of the following locations (first found wins):
 
 CLI flags always override config file values.
 
+> **Security:** the config file is sourced as shell, so it executes with
+> hoist's privileges. Keep it owned by the running user (or root) and not
+> writable by others, and never point `$HOIST_CONFIG` at an attacker-writable
+> path (e.g. a world-writable directory or a file another user controls) — an
+> attacker who can edit it gains arbitrary code execution as the hoist user.
+
 | Setting | Default | Description |
 |---|---|---|
 | `PARALLEL` | `1` | Containers to process concurrently |
@@ -103,6 +109,7 @@ bash hoist.sh [options]
 | `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
 | `--update` | Self-update hoist to the latest GitHub release (interactive — prompts before replacing) |
 | `--force` | With `--update`, skip the confirmation prompt and reinstall even if already up to date |
+| `--force-update-check` | Ignore the cached self-update check and query the GitHub API now (the check is otherwise cached for 6h) |
 | `--version` | Print version and exit |
 | `-h`, `--help`, `-?` | Show help and exit |
 
@@ -112,7 +119,14 @@ After every run, hoist prints a one-line summary:
 [HH:MM:SS] Run complete: 3 updated (1 failed), 2 notified, 5 no-change, 12 skipped
 ```
 
-In `--dry-run` mode this becomes `Run complete (dry-run): N would update, N would notify, ...`.
+In `--dry-run` mode this becomes `Run complete (dry-run): N eligible to update, N eligible to notify (not pulled — run live to detect available updates), ...`. Dry-run does **not** pull images (a pull would re-point the tag and demote the running image to dangling), so it reports which containers are *configured and not paused* to act — not which actually have a newer image waiting.
+
+### Exit codes and the run lock
+
+- **Exit code** — hoist exits non-zero if any container produced an `update_failed`, `unhealthy`, or `rollback_failed` outcome (and the end-of-run Healthchecks.io ping is `/fail`). A clean run exits 0. This drives `Type=oneshot` systemd units, cron `MAILTO`, and CI.
+- **Run lock** — at startup hoist takes an exclusive lock on `CACHE_LOCATION/hoist.lock` (`flock`, with an `mkdir`-plus-stale-PID fallback when `flock` is absent). A second hoist that finds the lock held logs a line and exits cleanly (0) rather than racing the first over shared state. `--list`/`--status` skips the lock.
+- **Boolean labels** — the `update`, `notify`, `rollback`, and `healthcheck.wait` gates (and `ROLLBACK_DEFAULT`) accept `true`, `1`, `yes`, or `on`, case-insensitively.
+- **`not_compose_managed`** — a container carrying hoist `update`/`notify` labels but no `com.docker.compose.*` metadata is logged unconditionally (it can't be acted on) and tallied under this token instead of being silently skipped.
 
 ## Labels
 
@@ -188,7 +202,7 @@ Three labels gate whether an update is applied (notifications still fire so you 
 Two opt-in safety nets stack on top of the normal `compose up` flow:
 
 - **`healthcheck.wait`** — after `compose up` succeeds, hoist polls `docker inspect --format '{{.State.Health.Status}}'`. Reaches `healthy`: success. `unhealthy`/`exited`/timeout: emits the `unhealthy` token. Per-container `healthcheck.timeout` overrides the global `HEALTHCHECK_TIMEOUT` (default 120s, polled every `HEALTHCHECK_INTERVAL` seconds — default 2). **Images without a `HEALTHCHECK` directive** fall back to `.State.Status`, which only distinguishes `running` from `exited`. A warning is logged and the wait succeeds the moment the container is `running` — add a real `HEALTHCHECK` to the image if you need stronger guarantees.
-- **`rollback`** — on update failure OR unhealthy outcome, hoist re-aliases the prior image SHA back onto the original tag and re-runs `compose up --no-pull`. Emits `rolled_back` on success, `rollback_failed` on failure. **Caveat:** the old image must still be present locally. If `PRUNE_IMAGES=true` removed it between runs, rollback fails clearly with `rollback_failed` rather than silently. Set `ROLLBACK_DEFAULT=true` in config to enable rollback for every container without per-container labels.
+- **`rollback`** — on update failure OR unhealthy outcome, hoist re-aliases the prior image SHA back onto the original tag and re-runs `compose up --pull never`. Emits `rolled_back` on success, `rollback_failed` on failure. **Caveat:** the old image must still be present locally. If `PRUNE_IMAGES=true` removed it between runs, rollback fails clearly with `rollback_failed` rather than silently. Set `ROLLBACK_DEFAULT=true` in config to enable rollback for every container without per-container labels.
 
 ## Custom scripts
 
@@ -225,6 +239,8 @@ On every run, hoist checks the GitHub releases API for a newer version. Behavior
 - **`notify`** (default) — logs a message and fires global webhooks (Discord/Slack/generic) once per new version, then continues normal operation. A sentinel file in `CACHE_LOCATION` suppresses repeat notifications for the same version.
 - **`update`** — automatically downloads, SHA256-verifies, and replaces the script on disk. Webhooks still fire before the update is applied. **Avoid this on cron** — a breaking release will affect every subsequent unattended run.
 - **`off`** — skips the check entirely.
+
+The check result is cached in `CACHE_LOCATION/hoist-self-update-check.cache` for `UPDATE_CHECK_CACHE_TTL` seconds (default 6h), so a cron/timer-fired hoist doesn't hit the GitHub API on every run. Pass `--force-update-check` to query immediately regardless of the cache; an interactive `--update` always checks live.
 
 To trigger an interactive update manually:
 

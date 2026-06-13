@@ -94,3 +94,9 @@
 #          any breaking change in the new version will affect every subsequent unattended run.
 #          Use "notify" (default) to receive alerts and apply updates manually instead.
 # UPDATE_CHECK="notify"
+
+# How long (seconds) to cache the self-update check so unattended runs don't hit
+# the GitHub API on every invocation (default: 21600 = 6h). The result is stored
+# in CACHE_LOCATION/hoist-self-update-check.cache. Pass --force-update-check to
+# query immediately regardless of the cache. Interactive --update always checks live.
+# UPDATE_CHECK_CACHE_TTL=21600

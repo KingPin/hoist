@@ -41,6 +41,12 @@ _sudo_if_needed() {
     while [[ ! -e "$probe" && "$probe" != "/" ]]; do
         probe="$(dirname "$probe")"
     done
+    # Refuse to operate beneath a symlinked ancestor: a symlinked install dir
+    # could silently redirect a privileged write (install/mkdir) to an
+    # attacker-chosen location.
+    if [[ -L "$probe" ]]; then
+        err "refusing to act under symlinked path component: $probe (target: $target)"
+    fi
     if [[ -w "$probe" ]]; then
         "$@" || err "step failed (target: $target): $*"
     elif command -v sudo >/dev/null 2>&1; then
@@ -71,7 +77,13 @@ fi
 tmp=$(mktemp -d -t hoist.XXXXXX 2>/dev/null) \
     || tmp=$(mktemp -d "${TMPDIR:-/tmp}/hoist.XXXXXX") \
     || err "failed to create temp directory"
-trap 'rm -rf "$tmp"' EXIT INT TERM HUP
+# EXIT owns cleanup; the signal traps just exit with 128+signum, which fires the
+# EXIT trap exactly once. Without an explicit exit, a caught INT/TERM/HUP would
+# clean up but then fall through and keep running the rest of the installer.
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # hoist.sh is required; hoist.conf.example is best-effort so the installer still
 # works against releases that predate the conf.example asset. We use -w to
