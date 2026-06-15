@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.8.1"
+HOIST_VERSION="1.8.2"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -427,6 +427,22 @@ _acquire_run_lock() {
             log "Another hoist run holds the lock ($lock); exiting."
             exit 0
         fi
+        # flock is held against the open file description, not this process, and
+        # bash does NOT set close-on-exec on {var}> fds — so every docker/compose
+        # child we exec and every &-spawned worker inherits _LOCK_FD and keeps the
+        # lock held until its own copy closes. A Ctrl+C mid-`docker compose pull`
+        # can orphan a docker subprocess that keeps the inherited fd open, wedging
+        # every later run with "Another hoist run holds the lock". Hand the held fd
+        # to one childless holder process, then close our copy so nothing we exec
+        # or fork afterwards can pin the lock. `disown` keeps the holder out of the
+        # job table (so the parallel pool's `wait`/`wait -n` ignore it); the EXIT
+        # trap — which also runs after _on_signal's `exit` on INT/TERM — kills the
+        # holder, releasing the lock the instant hoist truly exits.
+        ( exec sleep 2147483647 ) &
+        _LOCK_HOLDER=$!
+        disown
+        exec {_LOCK_FD}>&-
+        trap '[[ -n "${_LOCK_HOLDER:-}" ]] && kill "$_LOCK_HOLDER" 2>/dev/null' EXIT
         return 0
     fi
     # flock unavailable: atomic mkdir lock. mkdir fails if the dir exists, which
