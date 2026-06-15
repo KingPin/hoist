@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.8.0"
+HOIST_VERSION="1.8.1"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -392,7 +392,15 @@ _compose_exec() {
 
 compose_pull_wrapper() {
     [[ "$1" == /* ]] || { log "Error: compose workdir is not an absolute path: $1"; return 1; }
-    _with_project_lock "$1" _compose_exec "$1" "$2" pull
+    # Under --parallel, sibling containers' compose-pull progress bars interleave
+    # into unreadable garbage. Suppress Docker's progress UI with --quiet there;
+    # hoist's own per-container "Pulling image..." log lines still show activity.
+    # Serial runs keep the verbose progress output.
+    if (( PARALLEL > 1 )); then
+        _with_project_lock "$1" _compose_exec "$1" "$2" pull --quiet
+    else
+        _with_project_lock "$1" _compose_exec "$1" "$2" pull
+    fi
 }
 
 compose_up_wrapper() {

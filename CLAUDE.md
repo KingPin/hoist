@@ -142,6 +142,8 @@ A worked Ansible playbook that drives `--cron install` through this contract liv
 
 `--parallel N` uses a bash worker pool (`process_container "$c" &` + `wait -n`) inside the same shell process. Forked subshells inherit functions and variables natively, so no `export -f` is needed — new helpers Just Work. Bash 4.3+ is required for `wait -n`. Per-container state goes through cache files (`.notified`, `.run-result`, `.rollup`) since variables modified in a `&` subshell don't propagate back to the parent.
 
+When `PARALLEL > 1`, `compose_pull_wrapper` (`hoist.sh:393`) passes `--quiet` to `docker compose pull` so sibling containers' progress bars don't interleave into unreadable output. Hoist's own per-container `Checking...` / `Pulling image...` log lines still print, so the run never looks hung. Serial runs (`PARALLEL=1`, the default) keep Docker's verbose progress output.
+
 ### Notification channels and rollup
 
 Per-container labels: discord, slack, generic, telegram, gotify, ntfy, teams, matrix. Each channel also has a `GLOBAL_*` fallback in config. When `WEBHOOK_ROLLUP=true`, channels listed in `WEBHOOK_ROLLUP_CHANNELS` get one summary message at end of run (using the `GLOBAL_*` URL) instead of per-container sends — per-container labels for those channels are ignored.

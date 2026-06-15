@@ -103,7 +103,7 @@ bash hoist.sh [options]
 | `--tag <value>` | Use a label subset (e.g. `--tag nightly` reads `com.sumguy.hoist.nightly.*` labels) |
 | `--dry-run` | Show what would be updated without pulling, recreating, or notifying (implies `--verbose`) |
 | `--verbose` | Log containers skipped because they have no hoist labels |
-| `--parallel <N>` | Process containers concurrently with `N` workers |
+| `--parallel <N>` | Process containers concurrently with `N` workers (`N > 1` passes `--quiet` to `docker compose pull` to keep interleaved progress output readable; hoist's own per-container log lines still show) |
 | `--only <names>` | Comma-separated list of container names to include (others ignored). Names not currently running emit a warning. |
 | `--exclude <names>` | Comma-separated list of container names to skip. Highest precedence — wins over `--only`. |
 | `--list`, `--status` | Print a table of all running containers with their label config and last-cached digest, then exit. No pulls or updates are performed. |
