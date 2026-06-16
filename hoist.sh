@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.8.2"
+HOIST_VERSION="1.8.3"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -363,7 +363,17 @@ _with_project_lock() {
         local fd
         exec {fd}>"$lock" || { log "Error: cannot open project lock $lock"; return 1; }
         flock "$fd"
-        "$@"; rc=$?
+        # The flock is held against the open file description, not this process,
+        # and bash sets no close-on-exec on {var}> fds — so the docker/compose
+        # child run below would otherwise inherit $fd and keep the lock held even
+        # after this worker dies. A Ctrl+C mid-`docker compose pull` then orphans
+        # that pull (reparented to init) holding the inherited fd, wedging every
+        # later run that touches this project on `flock` forever. Close $fd for
+        # the command only ({fd}>&-): this worker keeps its own copy open so the
+        # lock stays held for the pull/up, but the docker child cannot pin it —
+        # an orphaned pull no longer survives its worker. (Same fd-inheritance
+        # hazard the run lock handles via its childless holder process.)
+        "$@" {fd}>&-; rc=$?
         exec {fd}>&-
         return "$rc"
     fi
