@@ -2655,7 +2655,7 @@ print_summary() {
         done < "$f"
         if [[ $SUMMARY_LIST_NAMES == true && ( $_saw_updated == true || $_saw_update_failed == true ) ]]; then
             local _cname _name_file="${f%.run-result}.name"
-            if [[ -r $_name_file ]]; then
+            if [[ -r $_name_file && ! -L $_name_file ]]; then
                 _cname=$(cat "$_name_file")
             else
                 _cname="${f##*/hoist-}"
