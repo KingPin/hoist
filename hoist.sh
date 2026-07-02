@@ -2065,12 +2065,19 @@ _sanitize_name() {
 # token, so the .run-result/.rollup/.notified/.name files they share can
 # misattribute one container's outcome to the other (#8). cksum's CRC+length
 # pair is collision-resistant enough for this purpose without forking an
-# external hash binary.
+# external hash binary. Falls back to _sanitize_name if cksum is missing or
+# fails, so a broken/absent binary degrades to the old (still per-name, just
+# lossier) behavior instead of collapsing every container onto one empty key.
 _container_cache_key() {
     local -n __cck_out="$1"
     local __cck_s
-    __cck_s=$(printf '%s' "$2" | cksum)
-    __cck_out=${__cck_s// /_}
+    __cck_s=$(printf '%s' "$2" | cksum 2>/dev/null)
+    __cck_s=${__cck_s// /_}
+    if [[ -z $__cck_s ]]; then
+        _sanitize_name __cck_out "$2"
+        return
+    fi
+    __cck_out="$__cck_s"
 }
 
 # write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
