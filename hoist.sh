@@ -2658,11 +2658,12 @@ print_summary() {
         done < "$f"
         if [[ $SUMMARY_LIST_NAMES == true && ( $_saw_updated == true || $_saw_update_failed == true ) ]]; then
             local _cname _name_file="${f%.run-result}.name"
-            if [[ -r $_name_file && ! -L $_name_file ]]; then
+            _cname="${f##*/hoist-}"
+            _cname="${_cname%.run-result}"
+            if [[ -L $_name_file ]]; then
+                log "Refusing to read state file through a symlink: $_name_file"
+            elif [[ -r $_name_file ]]; then
                 _cname=$(cat "$_name_file")
-            else
-                _cname="${f##*/hoist-}"
-                _cname="${_cname%.run-result}"
             fi
             [[ $_saw_updated == true ]]       && updated_names+=("$_cname")
             [[ $_saw_update_failed == true ]] && failed_names+=("$_cname")
