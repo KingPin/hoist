@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.8.3"
+HOIST_VERSION="1.9.0"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -30,6 +30,7 @@ ROLLBACK_DEFAULT="false"
 MAINTENANCE_WINDOW=""
 HOIST_HOSTNAME=""
 VERBOSE=false
+SUMMARY_LIST_NAMES=true
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 UPDATE_CHECK="${UPDATE_CHECK:-notify}"
 # Self-update API check is cached this many seconds so cron-fired runs don't hit
@@ -2541,6 +2542,10 @@ process_container() {
     local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
     # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
     _state_path_safe "$_result_file" || return 1
+    if [[ $SUMMARY_LIST_NAMES == true ]]; then
+        local _name_file="${CACHE_LOCATION}/hoist-${safe_name}.name"
+        _state_path_safe "$_name_file" && printf '%s' "$container_name" > "$_name_file"
+    fi
     local -a _tokens=()
     log "$container_name: Checking..."
 
@@ -2580,6 +2585,9 @@ process_container() {
             _dedup_key=${_dedup_key// /_}
             if ! mkdir "${CACHE_LOCATION}/hoist-compose-${_dedup_key}.deduped" 2>/dev/null; then
                 [[ $VERBOSE == true ]] && log "$container_name: replica of '$docker_compose_service' already processed this run — skipping"
+                # No .run-result entry is written on this path — drop the .name
+                # file written earlier so it doesn't orphan until the next run's wipe.
+                [[ $SUMMARY_LIST_NAMES == true ]] && rm -f "${CACHE_LOCATION}/hoist-${safe_name}.name"
                 return 0
             fi
         fi
@@ -2626,12 +2634,14 @@ print_summary() {
     local paused=0 constraint_blocked=0 group_aborted=0
     local unhealthy=0 rolled_back=0 rollback_failed=0 not_compose_managed=0
     local f token
+    local -a updated_names=() failed_names=()
     for f in "${CACHE_LOCATION}"/hoist-*.run-result; do
         [[ -f $f ]] || continue
+        local _saw_updated=false _saw_update_failed=false
         while IFS= read -r token; do
             case "$token" in
-                updated)            (( updated++ )) ;;
-                update_failed)      (( update_failed++ )) ;;
+                updated)            (( updated++ )); _saw_updated=true ;;
+                update_failed)      (( update_failed++ )); _saw_update_failed=true ;;
                 notified)           (( notified++ )) ;;
                 no_change)          (( no_change++ )) ;;
                 skipped)            (( skipped++ )) ;;
@@ -2646,7 +2656,29 @@ print_summary() {
                 not_compose_managed) (( not_compose_managed++ )) ;;
             esac
         done < "$f"
+        if [[ $SUMMARY_LIST_NAMES == true && ( $_saw_updated == true || $_saw_update_failed == true ) ]]; then
+            local _cname _name_file="${f%.run-result}.name"
+            _cname="${f##*/hoist-}"
+            _cname="${_cname%.run-result}"
+            if [[ -L $_name_file ]]; then
+                log "Refusing to read state file through a symlink: $_name_file"
+            elif [[ -r $_name_file ]]; then
+                _cname=$(cat "$_name_file")
+            fi
+            [[ $_saw_updated == true ]]       && updated_names+=("$_cname")
+            [[ $_saw_update_failed == true ]] && failed_names+=("$_cname")
+        fi
     done
+
+    local updated_joined="" failed_joined=""
+    if (( ${#updated_names[@]} )); then
+        updated_joined=$(printf '%s, ' "${updated_names[@]}")
+        updated_joined=${updated_joined%, }
+    fi
+    if (( ${#failed_names[@]} )); then
+        failed_joined=$(printf '%s, ' "${failed_names[@]}")
+        failed_joined=${failed_joined%, }
+    fi
 
     local msg
     if [[ $DRY_RUN == true ]]; then
@@ -2656,7 +2688,14 @@ print_summary() {
         msg="Run complete (dry-run): ${would_update} eligible to update, ${would_notify} eligible to notify (not pulled — run live to detect available updates), ${skipped} skipped"
     else
         local updated_part="${updated} updated"
-        [[ $update_failed -gt 0 ]] && updated_part+=" (${update_failed} failed)"
+        if [[ $SUMMARY_LIST_NAMES == true && $updated -gt 0 ]]; then
+            updated_part+=" [${updated_joined}]"
+        fi
+        if [[ $update_failed -gt 0 ]]; then
+            updated_part+=" (${update_failed} failed"
+            [[ $SUMMARY_LIST_NAMES == true ]] && updated_part+=": ${failed_joined}"
+            updated_part+=")"
+        fi
         msg="Run complete: ${updated_part}, ${notified} notified, ${no_change} no-change, ${skipped} skipped"
     fi
     [[ $unhealthy -gt 0 ]]          && msg+=", ${unhealthy} unhealthy"
@@ -2801,10 +2840,10 @@ if [[ $DO_LIST == true ]]; then
 fi
 
 # Serialize runs (after --list, which is read-only and needs no lock) so the
-# shared run-result/rollup state below isn't clobbered by an overlapping run.
+# shared run-result/rollup/name state below isn't clobbered by an overlapping run.
 _acquire_run_lock
 
-rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
+rm -f "${CACHE_LOCATION}"/hoist-*.run-result "${CACHE_LOCATION}"/hoist-*.rollup "${CACHE_LOCATION}"/hoist-*.name "${CACHE_LOCATION}"/hoist-group-*.failed 2>/dev/null || true
 rmdir "${CACHE_LOCATION}"/hoist-compose-*.deduped 2>/dev/null || true
 setup_environment
 check_maintenance_window
