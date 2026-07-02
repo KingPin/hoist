@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.9.0"
+HOIST_VERSION="1.9.1"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -2057,11 +2057,34 @@ _sanitize_name() {
     __san_out="$__san_s"
 }
 
+# _container_cache_key <out-var> <container-name>
+# Map a container name to a per-container cache-file key by hashing it with
+# cksum, mirroring the (workdir, service) dedup key below. _sanitize_name's
+# character-collapsing is lossy — distinct names differing only in
+# underscore-run length (e.g. `app_1` and `app__1`) sanitize to the same
+# token, so the .run-result/.rollup/.notified/.name files they share can
+# misattribute one container's outcome to the other (#8). cksum's CRC+length
+# pair is collision-resistant enough for this purpose without forking an
+# external hash binary. Falls back to _sanitize_name if cksum is missing or
+# fails, so a broken/absent binary degrades to the old (still per-name, just
+# lossier) behavior instead of collapsing every container onto one empty key.
+_container_cache_key() {
+    local -n __cck_out="$1"
+    local __cck_s
+    __cck_s=$(printf '%s' "$2" | cksum 2>/dev/null)
+    __cck_s=${__cck_s// /_}
+    if [[ -z $__cck_s ]]; then
+        _sanitize_name __cck_out "$2"
+        return
+    fi
+    __cck_out="$__cck_s"
+}
+
 # write_rollup_entry <status> <container> <image> <old_digest> <new_digest>
 write_rollup_entry() {
     [[ $WEBHOOK_ROLLUP == true ]] || return 0
     local safe
-    _sanitize_name safe "$2"
+    _container_cache_key safe "$2"
     _state_path_safe "${CACHE_LOCATION}/hoist-${safe}.rollup" || return 0
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" \
         > "${CACHE_LOCATION}/hoist-${safe}.rollup"
@@ -2538,7 +2561,7 @@ _dispatch_notifications() {
 process_container() {
     local container_name="$1"
     local safe_name
-    _sanitize_name safe_name "$container_name"
+    _container_cache_key safe_name "$container_name"
     local _result_file="${CACHE_LOCATION}/hoist-${safe_name}.run-result"
     # Refuse to record outcomes through a planted symlink (shared-/tmp hardening).
     _state_path_safe "$_result_file" || return 1
@@ -2760,7 +2783,7 @@ list_containers() {
         fi
 
         local safe_name
-        _sanitize_name safe_name "$container_name"
+        _container_cache_key safe_name "$container_name"
         local raw_digest
         raw_digest=$(cat "${CACHE_LOCATION}/hoist-${safe_name}.notified" 2>/dev/null || true)
         if [[ -n $raw_digest ]]; then
