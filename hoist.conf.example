@@ -24,6 +24,10 @@
 # Log containers skipped due to missing hoist labels (default: false). Automatically enabled by --dry-run.
 # VERBOSE=true
 
+# Name updated/failed containers in the end-of-run summary line, e.g.
+# "4 updated (web, api, db, cache) [FAILED: worker]" instead of just counts (default: true).
+# SUMMARY_LIST_NAMES=false
+
 # Maximum time in seconds for webhook HTTP requests (default: 30).
 # CURL_TIMEOUT=30
 
