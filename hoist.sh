@@ -2670,15 +2670,15 @@ print_summary() {
         fi
     done
 
-    local updated_joined="" failed_joined="" n
-    for n in "${updated_names[@]}"; do
-        [[ -n $updated_joined ]] && updated_joined+=", "
-        updated_joined+="$n"
-    done
-    for n in "${failed_names[@]}"; do
-        [[ -n $failed_joined ]] && failed_joined+=", "
-        failed_joined+="$n"
-    done
+    local updated_joined="" failed_joined=""
+    if (( ${#updated_names[@]} )); then
+        updated_joined=$(printf '%s, ' "${updated_names[@]}")
+        updated_joined=${updated_joined%, }
+    fi
+    if (( ${#failed_names[@]} )); then
+        failed_joined=$(printf '%s, ' "${failed_names[@]}")
+        failed_joined=${failed_joined%, }
+    fi
 
     local msg
     if [[ $DRY_RUN == true ]]; then
