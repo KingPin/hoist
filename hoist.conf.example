@@ -25,7 +25,7 @@
 # VERBOSE=true
 
 # Name updated/failed containers in the end-of-run summary line, e.g.
-# "4 updated (web, api, db, cache) [FAILED: worker]" instead of just counts (default: true).
+# "4 updated [web, api, db, cache] (1 failed: worker)" instead of just counts (default: true).
 # SUMMARY_LIST_NAMES=false
 
 # Maximum time in seconds for webhook HTTP requests (default: 30).
