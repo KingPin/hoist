@@ -2585,6 +2585,9 @@ process_container() {
             _dedup_key=${_dedup_key// /_}
             if ! mkdir "${CACHE_LOCATION}/hoist-compose-${_dedup_key}.deduped" 2>/dev/null; then
                 [[ $VERBOSE == true ]] && log "$container_name: replica of '$docker_compose_service' already processed this run — skipping"
+                # No .run-result entry is written on this path — drop the .name
+                # file written earlier so it doesn't orphan until the next run's wipe.
+                [[ $SUMMARY_LIST_NAMES == true ]] && rm -f "${CACHE_LOCATION}/hoist-${safe_name}.name"
                 return 0
             fi
         fi
