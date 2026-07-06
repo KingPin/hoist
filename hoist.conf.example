@@ -6,7 +6,10 @@
 # Number of containers to process in parallel (default: 1)
 # PARALLEL=4
 
-# Directory for notification deduplication cache files (default: /tmp)
+# Directory for lock/cache/notification state files. The default resolves to a
+# per-user private dir (/tmp/hoist-<uid>, mode 0700) so runs by different users
+# on the same host (e.g. root and a rootless-docker user) don't collide on
+# root-owned files in a shared /tmp. Set an explicit path to override.
 # CACHE_LOCATION=/var/cache/hoist
 
 # Path to docker binary (default: $(which docker))

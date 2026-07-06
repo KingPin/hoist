@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-HOIST_VERSION="1.9.1"
+HOIST_VERSION="1.9.2"
 HOIST_REPO="KingPin/hoist"
 
 DOCKER_BINARY="${DOCKER_BINARY:-$(which docker)}"
@@ -262,10 +262,23 @@ done
 _validate_maintenance_window "$MAINTENANCE_WINDOW" || exit 2
 
 # Ensure CACHE_LOCATION exists, and lock it to 0700 when it's a directory we
-# create. We deliberately leave the shared default (/tmp) alone: it's sticky,
-# world-writable by design, and not ours to chmod. State files written there
-# get a symlink guard at each write site (_state_path_safe) instead.
-if [[ "$CACHE_LOCATION" != "/tmp" ]]; then
+# create. The bare default (/tmp) is shared across every user on the host, and
+# our state-file names are fixed (hoist.lock, hoist-self-update-check.cache, …).
+# So whoever runs hoist first — often root — ends up owning those files, and a
+# later run as a different user hits "Permission denied" opening them (the run
+# lock then aborts the whole run). Namespace the shared default into a per-user
+# private dir so runs by different users on the same host never collide. A
+# custom CACHE_LOCATION is taken as-is (the caller owns partitioning it).
+if [[ "$CACHE_LOCATION" == "/tmp" ]]; then
+    CACHE_LOCATION="/tmp/hoist-${EUID}"
+    mkdir -p "$CACHE_LOCATION" 2>/dev/null \
+        || { echo "Error: cannot create CACHE_LOCATION: $CACHE_LOCATION" >&2; exit 1; }
+    # /tmp is world-writable, so another user could pre-create this dir to read
+    # our state. If it exists but isn't ours, refuse rather than write into it.
+    [[ -O "$CACHE_LOCATION" ]] \
+        || { echo "Error: CACHE_LOCATION $CACHE_LOCATION exists but is not owned by the current user" >&2; exit 1; }
+    chmod 0700 "$CACHE_LOCATION" 2>/dev/null || true
+else
     mkdir -p "$CACHE_LOCATION" 2>/dev/null \
         || { echo "Error: cannot create CACHE_LOCATION: $CACHE_LOCATION" >&2; exit 1; }
     [[ -O "$CACHE_LOCATION" ]] && chmod 0700 "$CACHE_LOCATION" 2>/dev/null || true
@@ -288,11 +301,13 @@ setup_environment() {
     export HEALTHCHECK_TIMEOUT HEALTHCHECK_INTERVAL ROLLBACK_DEFAULT
 }
 
-# State files live in a shared, predictably-named CACHE_LOCATION (default /tmp).
-# An attacker who can guess our filename could pre-plant a symlink so our write
-# lands on a victim file. On a sticky /tmp we usually can't delete another
-# user's symlink, so the safe move is to refuse to write through it rather than
-# follow it. Returns 1 (caller skips the write) when the target is a symlink.
+# State files live in a predictably-named CACHE_LOCATION. The default is now a
+# per-user private dir (/tmp/hoist-$EUID, 0700), but a custom CACHE_LOCATION may
+# still sit on a shared/sticky path — and an attacker who can guess our filename
+# could pre-plant a symlink so our write lands on a victim file. On a sticky dir
+# we usually can't delete another user's symlink, so the safe move is to refuse
+# to write through it rather than follow it. Returns 1 (caller skips the write)
+# when the target is a symlink.
 _state_path_safe() {
     if [[ -L "$1" ]]; then
         log "Refusing to write state file through a symlink: $1"

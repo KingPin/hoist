@@ -25,7 +25,7 @@ CLI flags always override config file values.
 | Setting | Default | Description |
 |---|---|---|
 | `PARALLEL` | `1` | Containers to process concurrently |
-| `CACHE_LOCATION` | `/tmp` | Directory for notification dedup cache files |
+| `CACHE_LOCATION` | `/tmp/hoist-<uid>` | Directory for lock/cache/dedup state files; the default is a per-user `0700` dir so different users on one host don't collide |
 | `DOCKER_BINARY` | `$(which docker)` | Path to docker binary |
 | `PRUNE_IMAGES` | `true` | Prune dangling images after each run |
 | `LOG_FILE` | _(none)_ | Append log output to this file (in addition to stdout) |
